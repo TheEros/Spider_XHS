@@ -1,0 +1,15 @@
+services:
+  spider_xhs:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+
+    container_name: spider_xhs
+
+    restart: unless-stopped
+
+    env_file:
+      - .env
+
+    ports:
+      - "8000:8000"
