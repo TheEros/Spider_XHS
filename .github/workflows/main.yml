@@ -40,3 +40,10 @@ jobs:
       - name: Push changes
         run: |
           git push origin master
+
+      - name: Update http-api
+        run: |
+          git fetch origin http-api
+          git checkout -B http-api origin/http-api
+          git merge --no-edit master
+          git push origin http-api
