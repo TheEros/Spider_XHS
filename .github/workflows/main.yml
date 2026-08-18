@@ -35,7 +35,7 @@ jobs:
 
       - name: Sync upstream
         run: |
-          git merge --ff-only upstream/master
+          git merge --no-edit upstream/master
 
       - name: Push changes
         run: |
