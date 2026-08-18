@@ -206,6 +206,8 @@ best_kols = your_ai_agent(kol_list, brand_profile)
 
 ## 🛠️ 快速开始
 
+如需以 HTTP 服务方式接入，请参阅 [HTTP API 中文文档](./HTTP_API_中文文档.md)。服务覆盖 PC 网页端、创作者中心、蒲公英和千帆模块，并内置 Swagger（`/docs`）与 ReDoc（`/redoc`）。
+
 ### ⛳ 环境要求
 
 - Python 3.10+
@@ -429,5 +431,4 @@ ps: 请加群，人满或者过期 issue | wx 提醒
 | group-1 | group-2 | group-3 |
 |:--:|:--:|:--:|
 | <img width="280" alt="group1" src="https://cvcat.site/assets/group1.jpg" /> | <img width="280" alt="group2" src="https://cvcat.site/assets/group2.jpg" /> | <img width="280" alt="group3" src="https://cvcat.site/assets/group3.jpg" /> |
-
 

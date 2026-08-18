@@ -1,413 +1,502 @@
-import os
+"""Spider_XHS 的 FastAPI HTTP 服务。
 
-from fastapi import FastAPI, HTTPException
+所有上游调用均为同步 I/O，因此路由使用普通 ``def``，FastAPI 会在线程池中
+执行它们，避免阻塞事件循环。Cookie 只从服务端环境变量读取，不允许客户端
+在请求中传入，防止凭据意外出现在日志和调用链中。
+"""
+
+import base64
+import os
+from functools import lru_cache
+from typing import Any, Literal
+
+from fastapi import Body, FastAPI, HTTPException
 from loguru import logger
 from pydantic import BaseModel, Field
 
+from apis.xhs_creator_apis import XHS_Creator_Apis
 from apis.xhs_pc_apis import XHS_Apis
+from apis.xhs_pugongying_apis import PuGongYingAPI
+from apis.xhs_qianfan_apis import QianFanAPI
+from xhs_utils.cookie_util import trans_cookies
 from xhs_utils.data_util import handle_note_info
+from xhs_utils.xhs_creator import XHSCreatorAuth
 from xhs_utils.xhs_pc import XHSPcAuth
+
 
 app = FastAPI(
     title="Spider_XHS HTTP API",
-    description="Spider_XHS HTTP API wrapper",
-    version="1.0.0",
+    description="小红书 PC、创作者中心、蒲公英与千帆接口的统一 HTTP 封装。",
+    version="2.0.0",
+    contact={"name": "Spider_XHS"},
 )
 
 
-# ============================================================
-# Auth
-# ============================================================
-
-COOKIES = os.getenv("COOKIES")
-
-if not COOKIES:
-    logger.warning("COOKIES environment variable is not set")
+class UrlRequest(BaseModel):
+    url: str = Field(..., min_length=1, description="完整的小红书 URL")
 
 
-_auth: XHSPcAuth | None = None
-_api: XHS_Apis | None = None
+class UrlsRequest(BaseModel):
+    urls: list[str] = Field(..., min_items=1, max_items=100)
 
 
-def get_api() -> XHS_Apis:
-    """
-    延迟初始化 XHS API。
-
-    不在 server.py import 时调用 bootstrap，
-    避免 Node / Cookie / b1 出错导致整个 FastAPI 无法启动。
-    """
-
-    global _auth
-    global _api
-
-    if _api is not None:
-        return _api
-
-    if not COOKIES:
-        raise RuntimeError("COOKIES environment variable is required")
-
-    logger.info("Initializing XHS API...")
-
-    _auth = XHSPcAuth.from_cookie(COOKIES)
-
-    _api = XHS_Apis(_auth)
-
-    success, msg, _ = _api.bootstrap()
-
-    if not success:
-        _api = None
-        raise RuntimeError(f"XHS API bootstrap failed: {msg}")
-
-    logger.info("XHS API initialized successfully")
-
-    return _api
+class UserIdRequest(BaseModel):
+    user_id: str = Field(..., min_length=1)
 
 
-# ============================================================
-# Request Models
-# ============================================================
+class KeywordRequest(BaseModel):
+    keyword: str = Field(..., min_length=1)
 
 
-class NoteRequest(BaseModel):
-    url: str = Field(..., description="小红书笔记 URL")
+class CursorRequest(BaseModel):
+    cursor: str = ""
 
 
-class NotesRequest(BaseModel):
-    urls: list[str] = Field(..., description="小红书笔记 URL 列表")
-
-
-class UserNotesRequest(BaseModel):
-    url: str = Field(..., description="小红书用户主页 URL")
+class UserPageRequest(UserIdRequest, CursorRequest):
+    xsec_token: str = ""
+    xsec_source: str = ""
 
 
 class SearchRequest(BaseModel):
-    query: str = Field(..., description="搜索关键词")
-
-    require_num: int = Field(
-        default=10,
-        ge=1,
-        le=100,
-        description="需要返回的数量",
-    )
-
-    sort_type_choice: int = Field(
-        default=0,
-        ge=0,
-        le=4,
-        description=("排序方式: 0综合 1最新 2最多点赞 3最多评论 4最多收藏"),
-    )
-
-    note_type: int = Field(
-        default=0,
-        ge=0,
-        le=2,
-        description="笔记类型: 0不限 1视频 2图文",
-    )
-
-    note_time: int = Field(
-        default=0,
-        ge=0,
-        le=3,
-        description="时间: 0不限 1一天内 2一周内 3半年内",
-    )
-
-    note_range: int = Field(
-        default=0,
-        ge=0,
-        le=3,
-        description="范围: 0不限 1已看过 2未看过 3已关注",
-    )
-
-    pos_distance: int = Field(
-        default=0,
-        ge=0,
-        le=2,
-        description="距离: 0不限 1同城 2附近",
-    )
-
-    geo: dict[str, float] | None = Field(
-        default=None,
-        description='例如 {"latitude": 39.9725, "longitude": 116.4207}',
-    )
+    query: str = Field(..., min_length=1)
+    require_num: int = Field(10, ge=1, le=1000)
+    sort_type_choice: int = Field(0, ge=0, le=4)
+    note_type: int = Field(0, ge=0, le=2)
+    note_time: int = Field(0, ge=0, le=3)
+    note_range: int = Field(0, ge=0, le=3)
+    pos_distance: int = Field(0, ge=0, le=2)
+    geo: dict[str, float] | None = None
 
 
-# ============================================================
-# Health
-# ============================================================
+class SearchPageRequest(SearchRequest):
+    page: int = Field(1, ge=1)
+    search_id: str | None = None
 
 
-@app.get("/health")
-async def health():
-    return {
-        "success": True,
-        "status": "ok",
-    }
+class SearchUserRequest(BaseModel):
+    query: str = Field(..., min_length=1)
+    require_num: int = Field(10, ge=1, le=1000)
 
 
-# ============================================================
-# Single Note
-# ============================================================
+class HomefeedRequest(BaseModel):
+    category: str
+    require_num: int = Field(10, ge=1, le=1000)
 
 
-@app.post("/api/note")
-async def get_note(req: NoteRequest):
-    """
-    获取单篇笔记。
-    """
+class HomefeedPageRequest(BaseModel):
+    category: str
+    cursor_score: str = ""
+    refresh_type: int = 1
+    note_index: int = 0
+    num: int = Field(20, ge=1, le=100)
+    need_num: int = Field(10, ge=1, le=100)
 
+
+class NoteCommentPageRequest(BaseModel):
+    note_id: str
+    xsec_token: str
+    cursor: str = ""
+
+
+class InnerCommentRequest(BaseModel):
+    comment: dict[str, Any]
+    xsec_token: str
+    cursor: str = ""
+
+
+class CreatorPageRequest(BaseModel):
+    page: int = Field(0, ge=0)
+    tab: int = Field(0, ge=0)
+
+
+class MediaRequest(BaseModel):
+    media_type: Literal["image", "video"]
+    content_base64: str = Field(..., description="媒体文件的 Base64；可含 data URL 前缀")
+
+
+class PublishRequest(BaseModel):
+    title: str = Field("", max_length=100)
+    desc: str = ""
+    media_type: Literal["image", "video"] = "image"
+    images_base64: list[str] = Field(default_factory=list)
+    video_base64: str | None = None
+    topics: list[str] = Field(default_factory=list)
+    location: str | None = None
+    post_time: int | None = Field(None, description="定时发布时间，毫秒时间戳")
+    privacy_type: int = Field(1, alias="type")
+
+    class Config:
+        allow_population_by_field_name = True
+
+
+class CategoryPageRequest(BaseModel):
+    page: int = Field(1, ge=1)
+    content_tag: Any = None
+
+
+class CategoryUsersRequest(BaseModel):
+    num: int = Field(20, ge=1, le=1000)
+    content_tag: Any = None
+
+
+class QianfanPageRequest(BaseModel):
+    choice: str = "-1"
+    distribution_category: list[dict[str, Any]]
+    page: int = Field(1, ge=1)
+
+
+class QianfanUsersRequest(QianfanPageRequest):
+    num: int = Field(20, ge=1, le=1000)
+
+
+class InviteRequest(UserIdRequest):
+    product_name: str
+    start_time: str
+    end_time: str
+    invite_content: str
+    contact_info: str
+
+
+def _env(name: str, fallback: str | None = None) -> str:
+    value = os.getenv(name) or (os.getenv(fallback) if fallback else None)
+    if not value:
+        raise HTTPException(503, f"服务端未配置环境变量 {name}")
+    return value
+
+
+@lru_cache(maxsize=1)
+def get_pc_api() -> XHS_Apis:
+    logger.info("初始化 PC API")
+    return XHS_Apis(XHSPcAuth.from_cookie(_env("COOKIES"))).bootstrap()
+
+
+@lru_cache(maxsize=1)
+def get_creator_api() -> XHS_Creator_Apis:
+    logger.info("初始化 Creator API")
+    return XHS_Creator_Apis(
+        XHSCreatorAuth.from_cookie(_env("CREATOR_COOKIES"))
+    ).bootstrap()
+
+
+@lru_cache(maxsize=1)
+def get_pgy_api() -> PuGongYingAPI:
+    return PuGongYingAPI()
+
+
+@lru_cache(maxsize=1)
+def get_qianfan_api() -> QianFanAPI:
+    return QianFanAPI()
+
+
+def _cookies(name: str) -> dict[str, str]:
+    return trans_cookies(_env(name, "COOKIES"))
+
+
+def _result(result: tuple[bool, str, Any]) -> dict[str, Any]:
+    success, message, data = result
+    return {"success": bool(success), "message": str(message), "data": data}
+
+
+def _raw(data: Any, message: str = "成功") -> dict[str, Any]:
+    return {"success": True, "message": message, "data": data}
+
+
+def _decode_media(value: str) -> bytes:
     try:
-        api = get_api()
-
-        success, msg, note_info = api.get_note_info(req.url)
-
-        if not success:
-            return {
-                "success": False,
-                "message": msg,
-                "data": None,
-            }
-
-        if note_info and "data" in note_info:
-            items = note_info["data"].get("items", [])
-
-            if items:
-                note_info = items[0]
-
-                note_info["url"] = req.url
-
-                try:
-                    note_info = handle_note_info(note_info)
-                except Exception as e:
-                    logger.warning(f"handle_note_info failed: {e}")
-
-        return {
-            "success": True,
-            "message": msg,
-            "data": note_info,
-        }
-
-    except Exception as e:
-        logger.exception("get note failed")
-
-        raise HTTPException(
-            status_code=500,
-            detail=str(e),
-        )
+        encoded = value.split(",", 1)[1] if value.startswith("data:") else value
+        return base64.b64decode(encoded, validate=True)
+    except Exception as exc:
+        raise HTTPException(422, "媒体字段不是有效的 Base64") from exc
 
 
-# ============================================================
-# Batch Notes
-# ============================================================
+@app.get("/", tags=["系统"])
+def index():
+    return {"name": app.title, "version": app.version, "docs": "/docs", "redoc": "/redoc"}
 
 
-@app.post("/api/notes")
-async def get_notes(req: NotesRequest):
-    """
-    批量获取笔记。
+@app.get("/health", tags=["系统"])
+def health():
+    return {"success": True, "status": "ok"}
 
-    注意：
-    这里 HTTP API 只返回数据，
-    不执行原项目的媒体下载 / Excel 保存。
-    """
 
-    api = get_api()
+# PC：主页、用户、笔记与搜索
+@app.get("/api/pc/homefeed/categories", tags=["PC"])
+def pc_categories(): return _result(get_pc_api().get_homefeed_all_channel())
 
-    results = []
 
+@app.post("/api/pc/homefeed", tags=["PC"])
+def pc_homefeed(req: HomefeedPageRequest):
+    return _result(get_pc_api().get_homefeed_recommend(req.category, req.cursor_score, req.refresh_type, req.note_index, num=req.num, need_num=req.need_num))
+
+
+@app.post("/api/pc/homefeed/all", tags=["PC"])
+def pc_homefeed_all(req: HomefeedRequest): return _result(get_pc_api().get_homefeed_recommend_by_num(req.category, req.require_num))
+
+
+@app.get("/api/pc/users/me", tags=["PC"])
+def pc_me(): return _result(get_pc_api().get_user_me())
+
+
+@app.post("/api/pc/users/info", tags=["PC"])
+def pc_user(req: UserIdRequest): return _result(get_pc_api().get_user_info(req.user_id))
+
+
+@app.post("/api/pc/users/notes/page", tags=["PC"])
+def pc_user_notes_page(req: UserPageRequest): return _result(get_pc_api().get_user_note_info(req.user_id, req.cursor, req.xsec_token, req.xsec_source))
+
+
+@app.post("/api/pc/users/notes", tags=["PC"])
+def pc_user_notes(req: UrlRequest): return _result(get_pc_api().get_user_all_notes(req.url))
+
+
+@app.post("/api/pc/users/likes/page", tags=["PC"])
+def pc_user_likes_page(req: UserPageRequest): return _result(get_pc_api().get_user_like_note_info(req.user_id, req.cursor, req.xsec_token, req.xsec_source))
+
+
+@app.post("/api/pc/users/likes", tags=["PC"])
+def pc_user_likes(req: UrlRequest): return _result(get_pc_api().get_user_all_like_note_info(req.url))
+
+
+@app.post("/api/pc/users/collects/page", tags=["PC"])
+def pc_user_collects_page(req: UserPageRequest): return _result(get_pc_api().get_user_collect_note_info(req.user_id, req.cursor, req.xsec_token, req.xsec_source))
+
+
+@app.post("/api/pc/users/collects", tags=["PC"])
+def pc_user_collects(req: UrlRequest): return _result(get_pc_api().get_user_all_collect_note_info(req.url))
+
+
+@app.post("/api/pc/notes/detail", tags=["PC"])
+@app.post("/api/note", tags=["兼容接口"], include_in_schema=False)
+def pc_note(req: UrlRequest):
+    result = _result(get_pc_api().get_note_info(req.url))
+    if result["success"]:
+        items = ((result["data"] or {}).get("data") or {}).get("items") or []
+        if items:
+            note = dict(items[0]); note["url"] = req.url
+            try: result["data"] = handle_note_info(note)
+            except Exception as exc: logger.warning(f"笔记标准化失败: {exc}")
+    return result
+
+
+@app.post("/api/pc/notes/batch", tags=["PC"])
+@app.post("/api/notes", tags=["兼容接口"], include_in_schema=False)
+def pc_notes(req: UrlsRequest):
+    rows = []
     for url in req.urls:
-        try:
-            success, msg, note_info = api.get_note_info(url)
-
-            if success:
-                try:
-                    items = note_info["data"]["items"]
-
-                    if items:
-                        note = items[0]
-                        note["url"] = url
-
-                        try:
-                            note = handle_note_info(note)
-                        except Exception:
-                            pass
-
-                        results.append(
-                            {
-                                "success": True,
-                                "url": url,
-                                "data": note,
-                            }
-                        )
-
-                        continue
-
-                except Exception as e:
-                    msg = str(e)
-
-            results.append(
-                {
-                    "success": False,
-                    "url": url,
-                    "message": str(msg),
-                    "data": None,
-                }
-            )
-
-        except Exception as e:
-            logger.exception(f"get note failed: {url}")
-
-            results.append(
-                {
-                    "success": False,
-                    "url": url,
-                    "message": str(e),
-                    "data": None,
-                }
-            )
-
-    return {
-        "success": True,
-        "count": len(results),
-        "data": results,
-    }
+        try: rows.append({"url": url, **pc_note(UrlRequest(url=url))})
+        except Exception as exc: rows.append({"url": url, "success": False, "message": str(exc), "data": None})
+    return _raw(rows, f"处理完成：{sum(bool(x['success']) for x in rows)}/{len(rows)} 成功")
 
 
-# ============================================================
-# User All Notes
-# ============================================================
+@app.post("/api/pc/search/suggestions", tags=["PC"])
+def pc_suggestions(req: KeywordRequest): return _result(get_pc_api().get_search_keyword(req.keyword))
 
 
-@app.post("/api/user/notes")
-async def get_user_notes(req: UserNotesRequest):
-    """
-    获取指定用户的全部笔记 URL。
-    """
-
-    try:
-        api = get_api()
-
-        success, msg, notes = api.get_user_all_notes(req.url)
-
-        if not success:
-            return {
-                "success": False,
-                "message": msg,
-                "data": [],
-            }
-
-        result = []
-
-        for note in notes:
-            try:
-                note_id = note["note_id"]
-                xsec_token = note["xsec_token"]
-
-                note_url = (
-                    f"https://www.xiaohongshu.com/explore/"
-                    f"{note_id}"
-                    f"?xsec_token={xsec_token}"
-                )
-
-                result.append(
-                    {
-                        "note_id": note_id,
-                        "xsec_token": xsec_token,
-                        "url": note_url,
-                        "data": note,
-                    }
-                )
-
-            except Exception as e:
-                logger.warning(f"build note url failed: {e}")
-
-        return {
-            "success": True,
-            "message": msg,
-            "count": len(result),
-            "data": result,
-        }
-
-    except Exception as e:
-        logger.exception("get user notes failed")
-
-        raise HTTPException(
-            status_code=500,
-            detail=str(e),
-        )
+@app.post("/api/pc/search/notes/page", tags=["PC"])
+def pc_search_page(req: SearchPageRequest):
+    return _result(get_pc_api().search_note(req.query, req.page, req.sort_type_choice, req.note_type, req.note_time, req.note_range, req.pos_distance, req.geo or "", req.search_id))
 
 
-# ============================================================
-# Search
-# ============================================================
+@app.post("/api/pc/search/notes", tags=["PC"])
+@app.post("/api/search", tags=["兼容接口"], include_in_schema=False)
+def pc_search(req: SearchRequest):
+    return _result(get_pc_api().search_some_note(req.query, req.require_num, req.sort_type_choice, req.note_type, req.note_time, req.note_range, req.pos_distance, req.geo or ""))
 
 
-@app.post("/api/search")
-async def search(req: SearchRequest):
-    """
-    搜索小红书笔记。
-    """
+@app.post("/api/pc/search/users/page", tags=["PC"])
+def pc_search_users_page(query: str = Body(...), page: int = Body(1, ge=1)): return _result(get_pc_api().search_user(query, page))
 
-    try:
-        api = get_api()
 
-        success, msg, notes = api.search_some_note(
-            req.query,
-            req.require_num,
-            req.sort_type_choice,
-            req.note_type,
-            req.note_time,
-            req.note_range,
-            req.pos_distance,
-            req.geo,
-        )
+@app.post("/api/pc/search/users", tags=["PC"])
+def pc_search_users(req: SearchUserRequest): return _result(get_pc_api().search_some_user(req.query, req.require_num))
 
-        if not success:
-            return {
-                "success": False,
-                "message": msg,
-                "data": [],
-            }
 
-        result = []
+# PC：评论与消息
+@app.post("/api/pc/comments/page", tags=["PC"])
+def pc_comments_page(req: NoteCommentPageRequest): return _result(get_pc_api().get_note_out_comment(req.note_id, req.cursor, req.xsec_token))
 
-        for note in notes:
-            if note.get("model_type") != "note":
-                continue
 
-            try:
-                note_id = note["id"]
-                xsec_token = note["xsec_token"]
+@app.post("/api/pc/comments/all", tags=["PC"])
+def pc_comments_all(req: NoteCommentPageRequest): return _result(get_pc_api().get_note_all_out_comment(req.note_id, req.xsec_token))
 
-                note_url = (
-                    f"https://www.xiaohongshu.com/explore/"
-                    f"{note_id}"
-                    f"?xsec_token={xsec_token}"
-                )
 
-                result.append(
-                    {
-                        "id": note_id,
-                        "xsec_token": xsec_token,
-                        "url": note_url,
-                        "data": note,
-                    }
-                )
+@app.post("/api/pc/comments/replies/page", tags=["PC"])
+def pc_replies_page(req: InnerCommentRequest): return _result(get_pc_api().get_note_inner_comment(req.comment, req.cursor, req.xsec_token))
 
-            except Exception as e:
-                logger.warning(f"build search note failed: {e}")
 
-        return {
-            "success": True,
-            "message": msg,
-            "query": req.query,
-            "count": len(result),
-            "data": result,
-        }
+@app.post("/api/pc/comments/replies/all", tags=["PC"])
+def pc_replies_all(req: InnerCommentRequest): return _result(get_pc_api().get_note_all_inner_comment(req.comment, req.xsec_token))
 
-    except Exception as e:
-        logger.exception("search failed")
 
-        raise HTTPException(
-            status_code=500,
-            detail=str(e),
-        )
+@app.post("/api/pc/notes/comments", tags=["PC"])
+def pc_note_comments(req: UrlRequest): return _result(get_pc_api().get_note_all_comment(req.url))
+
+
+@app.get("/api/pc/messages/unread", tags=["PC"])
+def pc_unread(): return _result(get_pc_api().get_unread_message())
+
+
+@app.post("/api/pc/messages/mentions/page", tags=["PC"])
+def pc_mentions_page(req: CursorRequest): return _result(get_pc_api().get_metions(req.cursor))
+
+
+@app.get("/api/pc/messages/mentions", tags=["PC"])
+def pc_mentions(): return _result(get_pc_api().get_all_metions())
+
+
+@app.post("/api/pc/messages/likes-collects/page", tags=["PC"])
+def pc_likes_page(req: CursorRequest): return _result(get_pc_api().get_likesAndcollects(req.cursor))
+
+
+@app.get("/api/pc/messages/likes-collects", tags=["PC"])
+def pc_likes(): return _result(get_pc_api().get_all_likesAndcollects())
+
+
+@app.post("/api/pc/messages/connections/page", tags=["PC"])
+def pc_connections_page(req: CursorRequest): return _result(get_pc_api().get_new_connections(req.cursor))
+
+
+@app.get("/api/pc/messages/connections", tags=["PC"])
+def pc_connections(): return _result(get_pc_api().get_all_new_connections())
+
+
+# Creator
+@app.get("/api/creator/user", tags=["Creator"])
+def creator_user(): return _result(get_creator_api().get_user_info())
+
+
+@app.post("/api/creator/topics", tags=["Creator"])
+def creator_topics(req: KeywordRequest): return _result(get_creator_api().get_topic(req.keyword))
+
+
+@app.post("/api/creator/locations", tags=["Creator"])
+def creator_locations(req: KeywordRequest): return _result(get_creator_api().get_location_info(req.keyword))
+
+
+@app.post("/api/creator/media/permit", tags=["Creator"])
+def creator_permit(media_type: Literal["image", "video"] = Body(..., embed=True)): return _result(get_creator_api().get_file_ids(media_type))
+
+
+@app.post("/api/creator/media/upload", tags=["Creator"])
+def creator_upload(req: MediaRequest): return _result(get_creator_api().upload_media(_decode_media(req.content_base64), req.media_type))
+
+
+@app.post("/api/creator/media/transcode", tags=["Creator"])
+def creator_transcode(video_id: str = Body(..., embed=True)): return _result(get_creator_api().query_transcode(video_id))
+
+
+@app.post("/api/creator/media/encryption", tags=["Creator"])
+def creator_encryption(file_id: str = Body(..., embed=True)): return _result(get_creator_api().encryption(file_id))
+
+
+@app.post("/api/creator/notes/publish", tags=["Creator"])
+def creator_publish(req: PublishRequest):
+    note = {"title": req.title, "desc": req.desc, "media_type": req.media_type, "topics": req.topics, "location": req.location, "postTime": req.post_time, "type": req.privacy_type}
+    if req.media_type == "image":
+        if not req.images_base64: raise HTTPException(422, "图文笔记必须提供 images_base64")
+        note["images"] = [_decode_media(x) for x in req.images_base64]
+    else:
+        if not req.video_base64: raise HTTPException(422, "视频笔记必须提供 video_base64")
+        note["video"] = _decode_media(req.video_base64)
+    return _result(get_creator_api().post_note(note))
+
+
+@app.post("/api/creator/notes/page", tags=["Creator"])
+def creator_notes_page(req: CreatorPageRequest): return _result(get_creator_api().get_posted_notes_page(req.page, req.tab))
+
+
+@app.post("/api/creator/notes", tags=["Creator"])
+def creator_notes(tab: int = Body(0, ge=0, embed=True)): return _result(get_creator_api().get_all_posted_notes(tab))
+
+
+# 蒲公英
+@app.get("/api/pgy/categories", tags=["蒲公英"])
+def pgy_categories(): return _raw(get_pgy_api().get_all_categories(_cookies("PUGONGYING_COOKIES")))
+
+
+@app.post("/api/pgy/track", tags=["蒲公英"])
+def pgy_track(data: dict[str, Any]): return _raw(get_pgy_api().get_track(data, _cookies("PUGONGYING_COOKIES")))
+
+
+@app.post("/api/pgy/users/page", tags=["蒲公英"])
+def pgy_users_page(req: CategoryPageRequest):
+    users, total = get_pgy_api().get_user_by_page(req.page, _cookies("PUGONGYING_COOKIES"), req.content_tag)
+    return _raw({"list": users, "total": total})
+
+
+@app.post("/api/pgy/users", tags=["蒲公英"])
+def pgy_users(req: CategoryUsersRequest): return _raw(get_pgy_api().get_some_user(req.num, _cookies("PUGONGYING_COOKIES"), req.content_tag))
+
+
+@app.get("/api/pgy/self", tags=["蒲公英"])
+def pgy_self(): return _raw(get_pgy_api().get_self_info(_cookies("PUGONGYING_COOKIES")))
+
+
+def _pgy_user(method: str, req: UserIdRequest): return _raw(getattr(get_pgy_api(), method)(req.user_id, _cookies("PUGONGYING_COOKIES")))
+
+
+@app.post("/api/pgy/users/detail", tags=["蒲公英"])
+def pgy_detail(req: UserIdRequest): return _pgy_user("get_user_detail", req)
+
+
+@app.post("/api/pgy/users/fans", tags=["蒲公英"])
+def pgy_fans(req: UserIdRequest): return _pgy_user("get_user_fans_detail", req)
+
+
+@app.post("/api/pgy/users/fans/history", tags=["蒲公英"])
+def pgy_fans_history(req: UserIdRequest): return _pgy_user("get_user_fans_history", req)
+
+
+@app.post("/api/pgy/users/notes", tags=["蒲公英"])
+def pgy_notes(req: UserIdRequest): return _pgy_user("get_user_notes_detail", req)
+
+
+@app.post("/api/pgy/invites", tags=["蒲公英"])
+def pgy_invite(req: InviteRequest):
+    return _raw(get_pgy_api().send_invite(req.user_id, _cookies("PUGONGYING_COOKIES"), req.product_name, [req.start_time, req.end_time], req.invite_content, req.contact_info))
+
+
+# 千帆
+@app.get("/api/qianfan/categories", tags=["千帆"])
+def qf_categories(): return _raw(get_qianfan_api().get_all_categories(_cookies("QIANFAN_COOKIES")))
+
+
+@app.post("/api/qianfan/users/page", tags=["千帆"])
+def qf_users_page(req: QianfanPageRequest):
+    users, total = get_qianfan_api().get_user_by_page(req.choice, req.distribution_category, req.page, _cookies("QIANFAN_COOKIES"))
+    return _raw({"list": users, "total": total})
+
+
+@app.post("/api/qianfan/users", tags=["千帆"])
+def qf_users(req: QianfanUsersRequest): return _raw(get_qianfan_api().get_some_user(req.choice, req.distribution_category, req.num, _cookies("QIANFAN_COOKIES")))
+
+
+def _qf_user(method: str, req: UserIdRequest): return _raw(getattr(get_qianfan_api(), method)(req.user_id, _cookies("QIANFAN_COOKIES")))
+
+
+@app.post("/api/qianfan/users/detail", tags=["千帆"])
+def qf_detail(req: UserIdRequest): return _qf_user("get_user_detail", req)
+
+
+@app.post("/api/qianfan/users/cooperation", tags=["千帆"])
+def qf_cooperation(req: UserIdRequest): return _qf_user("get_user_cooperation", req)
+
+
+@app.post("/api/qianfan/users/shops", tags=["千帆"])
+def qf_shops(req: UserIdRequest): return _qf_user("get_user_shop", req)
+
+
+@app.post("/api/qianfan/users/items", tags=["千帆"])
+def qf_items(req: UserIdRequest): return _qf_user("get_user_item", req)
+
+
+@app.post("/api/qianfan/users/fans", tags=["千帆"])
+def qf_fans(req: UserIdRequest): return _qf_user("get_user_fans", req)
+
+
+@app.exception_handler(Exception)
+async def unhandled_exception(_request, exc: Exception):
+    # HTTPException 由 FastAPI 自己处理；这里只兜底未预期的上游/签名错误。
+    logger.exception(f"HTTP API 调用失败: {exc}")
+    from fastapi.responses import JSONResponse
+    return JSONResponse(status_code=500, content={"success": False, "message": str(exc), "data": None})
