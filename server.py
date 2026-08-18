@@ -11,6 +11,7 @@ from functools import lru_cache
 from typing import Any, Literal
 
 from fastapi import Body, FastAPI, HTTPException
+from fastapi.openapi.utils import get_openapi
 from loguru import logger
 from pydantic import BaseModel, Field
 
@@ -30,6 +31,98 @@ app = FastAPI(
     version="2.0.0",
     contact={"name": "Spider_XHS"},
 )
+
+
+# 文档示例只用于 Swagger/ReDoc 展示，不会参与真实请求处理。
+OPENAPI_VALUE_EXAMPLES: dict[str, Any] = {
+    "url": "https://www.xiaohongshu.com/explore/64b7f000000000001203abcd",
+    "urls": [
+        "https://www.xiaohongshu.com/explore/64b7f000000000001203abcd",
+        "https://www.xiaohongshu.com/explore/64b7f000000000001203abce",
+    ],
+    "user_id": "5f123456000000000100abcd",
+    "keyword": "露营",
+    "query": "上海探店",
+    "category": "homefeed_recommend",
+    "cursor": "",
+    "cursor_score": "",
+    "xsec_token": "示例 xsec_token",
+    "xsec_source": "pc_user",
+    "note_id": "64b7f000000000001203abcd",
+    "comment": {"id": "示例评论 ID", "note_id": "示例笔记 ID"},
+    "media_type": "image",
+    "content_base64": "data:image/jpeg;base64,/9j/4AAQSkZJRgABAQ...",
+    "video_id": "示例视频 ID",
+    "file_id": "示例文件 ID",
+    "title": "周末露营记录",
+    "desc": "天气很好，分享这次露营体验。",
+    "images_base64": ["data:image/jpeg;base64,/9j/4AAQSkZJRgABAQ..."],
+    "video_base64": "data:video/mp4;base64,AAAAIGZ0eXBpc29t...",
+    "topics": ["露营", "周末去哪儿"],
+    "location": "上海市",
+    "content_tag": {"一级分类": "美食"},
+    "distribution_category": [{"id": "1", "name": "美食"}],
+    "product_name": "示例产品",
+    "start_time": "2026-08-20",
+    "end_time": "2026-08-31",
+    "invite_content": "诚邀您参与本次合作。",
+    "contact_info": "example@example.com",
+}
+
+
+def _schema_example(schema: dict[str, Any], schemas: dict[str, Any]) -> Any:
+    """从 OpenAPI schema 递归生成一个适合在线文档展示的请求示例。"""
+    if "$ref" in schema:
+        schema = schemas.get(schema["$ref"].rsplit("/", 1)[-1], {})
+    if "example" in schema:
+        return schema["example"]
+    if "default" in schema:
+        return schema["default"]
+    if schema.get("type") == "object" or "properties" in schema:
+        return {
+            name: OPENAPI_VALUE_EXAMPLES.get(name, _schema_example(value, schemas))
+            for name, value in schema.get("properties", {}).items()
+        }
+    if schema.get("type") == "array":
+        return [_schema_example(schema.get("items", {}), schemas)]
+    return {"string": "示例值", "integer": 1, "number": 1.0, "boolean": True}.get(
+        schema.get("type"), {}
+    )
+
+
+def custom_openapi() -> dict[str, Any]:
+    """为所有接口统一补充请求和成功响应示例。"""
+    if app.openapi_schema:
+        return app.openapi_schema
+    schema = get_openapi(
+        title=app.title,
+        version=app.version,
+        description=app.description,
+        routes=app.routes,
+    )
+    schemas = schema.get("components", {}).get("schemas", {})
+    success_example = {
+        "success": True,
+        "message": "成功",
+        "data": {"示例字段": "上游接口返回的数据"},
+    }
+    for path_item in schema.get("paths", {}).values():
+        for operation in path_item.values():
+            if not isinstance(operation, dict) or "responses" not in operation:
+                continue
+            json_body = operation.get("requestBody", {}).get("content", {}).get("application/json")
+            if json_body and "example" not in json_body and "examples" not in json_body:
+                json_body["example"] = _schema_example(json_body.get("schema", {}), schemas)
+            response_200 = operation["responses"].get("200")
+            if response_200 is not None:
+                content = response_200.setdefault("content", {}).setdefault("application/json", {})
+                content.setdefault("schema", {"type": "object"})
+                content.setdefault("example", success_example)
+    app.openapi_schema = schema
+    return schema
+
+
+app.openapi = custom_openapi
 
 
 class UrlRequest(BaseModel):
