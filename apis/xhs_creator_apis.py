@@ -10,6 +10,7 @@ from xhs_utils.xhs_creator import XHSCreatorAuth
 from xhs_utils.xhs_creator.http import CREATOR_ACCEPT_ENCODING
 from xhs_utils.xhs_creator.params import (
     build_creator_business_headers,
+    CREATOR_CURRENT_BROWSER_UA,
     generate_request_params,
     splice_str,
 )
@@ -29,11 +30,33 @@ from xhs_utils.xhs_pc.params import generate_x_rap_param
 TRANSCODE_MAX_RETRIES = 20
 TRANSCODE_RETRY_DELAY = 3
 
+
+def _load_media_bytes(path_or_file):
+    """媒体入参统一为字节：bytes 原样返回，str/PathLike 按本地文件读取。"""
+    if isinstance(path_or_file, (bytes, bytearray, memoryview)):
+        return bytes(path_or_file)
+    if isinstance(path_or_file, (str, os.PathLike)):
+        with open(path_or_file, 'rb') as handle:
+            return handle.read()
+    raise TypeError(
+        f'media must be bytes or a local file path, got {type(path_or_file).__name__}'
+    )
+
 CREATOR_HOME_REFERER = "https://creator.xiaohongshu.com/new/home"
 CREATOR_NOTE_MANAGER_REFERER = "https://creator.xiaohongshu.com/new/note-manager"
 CREATOR_PUBLISH_REFERER = (
     "https://creator.xiaohongshu.com/publish/publish"
-    "?source=official&from=menu&target=image"
+    "?source=official&from=tab_switch"
+)
+
+CREATOR_PUBLISH_COOKIE_ORDER = (
+    'abRequestId', 'ets', 'a1', 'webId', 'gid',
+    'x-rednote-datactry', 'x-rednote-holderctry', '_gray_did', 'id_token',
+    'customer-sso-sid', 'x-user-id-creator.xiaohongshu.com',
+    'customerClientId', 'access-token-creator.xiaohongshu.com',
+    'galaxy_creator_session_id', 'galaxy.creator.beaker.session.id',
+    'web_session', 'unread', 'webBuild', 'xsecappid', 'acw_tc',
+    'websectiga', 'sec_poison_id', 'loadts',
 )
 
 CREATOR_NOTE_MANAGER_HEADER_ORDER = (
@@ -121,6 +144,7 @@ class XHS_Creator_Apis:
     - ``XHSCreatorAuth.from_cookie(完整 Creator Cookie)``
     - ``XHSCreatorAuth.from_qrcode_login()``
     - ``XHSCreatorAuth.from_phone_login()``
+    - ``XHSCreatorAuth.from_pc_auth(pc_auth)``（统一登录后的 Creator 视图）
 
     业务方法不再散传 Cookie、a1、b1、dsl。b1、MNS、X-s、X-t、
     X-S-Common、trace id 和 Cookie 生命周期均由 Auth 内部维护。
@@ -153,11 +177,17 @@ class XHS_Creator_Apis:
         referer=None,
         sec_fetch_site='same-site',
         b1_profile=None,
+        b1_value=None,
         mns_profile=None,
         target_origin=None,
         order_wire_headers=True,
     ):
         """按 Creator 4.3.6 浏览器链路生成请求头、Cookie 和线上的紧凑 body。"""
+        # The publish document keeps one page-level b1 snapshot across all
+        # XHRs.  Reusing the named login snapshot prevents each API call from
+        # emitting a subtly different x8/x9 pair in X-S-Common.
+        if b1_profile is None:
+            b1_profile = 'login'
         web_origin = self.auth.origin('web')
         headers, cookies, body = generate_request_params(
             self.auth,
@@ -165,6 +195,7 @@ class XHS_Creator_Apis:
             data,
             method,
             b1_profile=b1_profile,
+            b1_value=b1_value,
             mns_profile=mns_profile,
             origin=web_origin,
             referer=referer or f'{web_origin}/',
@@ -174,12 +205,30 @@ class XHS_Creator_Apis:
         )
         target = (target_origin or self.base_url) + api
         wire_cookies = self.auth.cookies_for_url(target, cookies)
+        if target.startswith(self.base_url):
+            # Current publish-tab Cookie order (Chrome 152).  In particular,
+            # creator.xiaohongshu.com's host-only acw_tc sits between the
+            # page release fields and websectiga/sec_poison_id; flattening it
+            # at the end produces a different edge fingerprint.
+            wire_cookies = {
+                **{
+                    name: wire_cookies[name]
+                    for name in CREATOR_PUBLISH_COOKIE_ORDER
+                    if name in wire_cookies
+                },
+                **{
+                    name: value
+                    for name, value in wire_cookies.items()
+                    if name not in CREATOR_PUBLISH_COOKIE_ORDER
+                },
+            }
         if order_wire_headers:
             headers = build_creator_business_headers(
                 headers,
                 wire_cookies,
                 method=method,
             )
+        headers['user-agent'] = CREATOR_CURRENT_BROWSER_UA
         return headers, wire_cookies, body
 
     def bootstrap(self, proxies=None):
@@ -199,6 +248,8 @@ class XHS_Creator_Apis:
                 'GET',
                 referer=CREATOR_NOTE_MANAGER_REFERER,
                 sec_fetch_site='same-origin',
+                b1_profile='login',
+                mns_profile='publish_user_info',
             )
             headers['cache-control'] = 'no-cache'
             headers['pragma'] = 'no-cache'
@@ -212,6 +263,14 @@ class XHS_Creator_Apis:
                 headers=wire_headers,
                 proxies=self._proxies(proxies),
                 timeout=REQUEST_TIMEOUT,
+            )
+            # The publish navigation receives creator.xiaohongshu.com's
+            # host-scoped acw_tc from this response.  Keep it in Auth's
+            # HostCookieStore so the immediately following permit/upload
+            # requests match the browser Cookie scope.
+            self.auth.update_cookies(
+                getattr(response, 'cookies', {}),
+                source_url=self.base_url + api,
             )
             res_json = response.json()
             success = bool(res_json.get('success'))
@@ -282,34 +341,111 @@ class XHS_Creator_Apis:
 
     # media_type: image or video
     def get_fileIds(self, media_type, proxies=None):
-        try:
-            api = "/api/media/v1/upload/creator/permit"
-            params = get_fileIds_params(media_type)
-            splice_api = splice_str(api, params)
-            # 发布页导航后的首个业务请求发生在该页面 DS 程序安装之前：
-            # permit 服务端只接受 note_manager 冷档位（MNS0101+nop，2026-07-25
-            # 六组合矩阵实证）；a1 档（ready/steady）一律 HTTP 406。
-            headers, cookies, _ = self._request_params(
-                splice_api,
-                '',
-                'GET',
-                referer=CREATOR_PUBLISH_REFERER,
-                sec_fetch_site='same-origin',
-                b1_profile='note_manager',
-                mns_profile='note_manager',
+        api = "/api/media/v1/upload/creator/permit"
+        params = get_fileIds_params(media_type)
+        splice_api = splice_str(api, params)
+        last_response = None
+        last_json = None
+        last_xt = None
+
+        # The publish page occasionally receives the same edge rejection as
+        # the post endpoint (HTTP 406 or JSON code=-1).  Rebuild the signed
+        # headers on every attempt so x-t/x-s/MNS sequence are not replayed.
+        for attempt in range(3):
+            try:
+                # Chrome 152 uses the publish-page 0101/a1 material.  The
+                # current page capture emits envConst=1349 for both image
+                # and video permit requests (the value is page/session
+                # state, not a permanent media-type constant).
+                permit_profile = (
+                    'publish_permit_video'
+                    if str(media_type).lower() == 'video'
+                    else 'publish_permit_image'
+                )
+                headers, cookies, _ = self._request_params(
+                    splice_api,
+                    '',
+                    'GET',
+                    referer=CREATOR_PUBLISH_REFERER,
+                    sec_fetch_site='same-origin',
+                    mns_profile=permit_profile,
+                    b1_profile='login',
+                )
+                last_xt = headers.get('x-t')
+                if os.environ.get('XHS_CREATOR_DEBUG'):
+                    _, material = self.auth.profile.resolve_mns_material(
+                        mns_profile=permit_profile,
+                    )
+                    logger.debug(
+                        'Creator permit sign meta: attempt={} media={} '
+                        'tier={} envConst={} envFpTail={} seq={} xsc_len={} '
+                        'x-t-present={}',
+                        attempt + 1,
+                        str(media_type),
+                        material.tier,
+                        material.env_const,
+                        bytes(material.env_fp_tail).hex(),
+                        max(0, int(self.auth.profile.session.mns_seq) - 1),
+                        len(headers.get('x-s-common', '')),
+                        bool(last_xt),
+                    )
+                response = self.http.get(
+                    self.base_url + splice_api,
+                    headers=headers,
+                    cookies=cookies,
+                    proxies=self._proxies(proxies),
+                    timeout=REQUEST_TIMEOUT,
+                )
+                last_response = response
+                # Keep any refreshed host-scoped acw_tc in the Auth jar.
+                self.auth.update_cookies(
+                    getattr(response, 'cookies', {}),
+                    source_url=self.base_url + splice_api,
+                )
+                res_json = response.json()
+                last_json = res_json
+                if os.environ.get('XHS_CREATOR_DEBUG'):
+                    logger.debug(
+                        'Creator permit response: attempt={} http={} code={} '
+                        'success={} permit_count={}',
+                        attempt + 1,
+                        getattr(response, 'status_code', None),
+                        res_json.get('code'),
+                        bool(res_json.get('success')),
+                        len((res_json.get('data') or {}).get('uploadTempPermits') or []),
+                    )
+            except Exception as error:
+                return False, _log_api_error(error), (last_json, last_xt)
+
+            data = res_json.get('data') or {}
+            result = data.get('result') or {}
+            permits = data.get('uploadTempPermits') or []
+            # Current responses expose success at the top level, while a few
+            # gateway variants additionally mirror it under data.result.
+            success = bool(res_json.get('success') or result.get('success'))
+            if success and permits:
+                return True, '获取fileIds成功', (res_json, last_xt)
+
+            code = res_json.get('code', result.get('code'))
+            status = getattr(last_response, 'status_code', None)
+            retryable = status == 406 or code == -1
+            message = (
+                res_json.get('msg')
+                or res_json.get('message')
+                or result.get('msg')
+                or result.get('message')
             )
-            response = self.http.get(
-                self.base_url + splice_api,
-                headers=headers,
-                cookies=cookies,
-                proxies=self._proxies(proxies),
-                timeout=REQUEST_TIMEOUT,
-            )
-            res_json = response.json()
-            success, msg = res_json["success"], '获取fileIds成功'
-        except Exception as error:
-            return False, _log_api_error(error), (None, None)
-        return success, msg, (res_json, headers['x-t'])
+            if retryable and attempt < 2:
+                logger.warning(
+                    f'发布许可被边缘拒绝（HTTP {status}, code={code}），'
+                    f'重发 ({attempt + 1}/3)'
+                )
+                continue
+            if not message:
+                message = f'获取上传许可失败 (HTTP {status}, code={code})'
+            return False, str(message), (res_json, last_xt)
+
+        return False, '获取上传许可失败', (last_json, last_xt)
 
     def get_file_ids(self, media_type, proxies=None):
         """``get_fileIds`` 的 PEP 8 别名。"""
@@ -323,6 +459,8 @@ class XHS_Creator_Apis:
             "video_id": '',
         }
         try:
+            # 先读文件再申请上传许可，路径错误时不浪费许可额度。
+            path_or_file = _load_media_bytes(path_or_file)
             success, msg, (data, xt) = self.get_fileIds(media_type, proxies=proxies)
             if not success:
                 raise RuntimeError(msg)
@@ -390,15 +528,15 @@ class XHS_Creator_Apis:
                 "resource_type": "0",
             }
             splice_api = splice_str(api, params)
-            # 与 permit 同契约：发布页导航后首请求的冷档形状（2026-07-25 实证）。
+            # 当前转码查询沿用发布许可页的 0101/a1 签名档位。
             # 另需 www 侧 web_session（PC 登录签发），否则 401 无登录信息。
             headers, cookies, _ = self._request_params(
                 splice_api,
                 '',
                 'GET',
                 target_origin=self.edith_url,
-                b1_profile='note_manager',
-                mns_profile='note_manager',
+                b1_profile='login',
+                mns_profile='publish_permit',
             )
             response = self.http.get(
                 self.edith_url + splice_api,
@@ -480,6 +618,7 @@ class XHS_Creator_Apis:
             video = noteInfo.get('video')
             if not video:
                 raise ValueError('video media requires noteInfo["video"]')
+            video = _load_media_bytes(video)
             cover, metadata = self.extract_video_cover_and_metadata(video)
             success, msg, fileInfo = self.upload_media(video, media_type, proxies=proxies)
             if not success:

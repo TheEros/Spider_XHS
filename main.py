@@ -15,6 +15,7 @@ from apis.xhs_creator_apis import XHS_Creator_Apis
 from apis.xhs_pc_apis import XHS_Apis
 from xhs_utils.xhs_creator import XHSCreatorAuth
 from xhs_utils.xhs_pc import XHSPcAuth
+from xhs_utils.xhs_auth import XHSUnifiedAuth
 
 
 # 手动选择平台：pc（普通网页版）或 creator（创作者中心）。
@@ -56,27 +57,39 @@ def _fetch_and_print_creator_notes(
 
 
 def pc_qrcode_login(note_url: str) -> dict[str, Any]:
-    """PC 纯 HTTP 二维码登录，随后获取一篇笔记。"""
-    auth = XHSPcAuth.from_qrcode_login(show_in_terminal=True)
-    return _fetch_and_print_pc_note(auth, note_url)
+    """统一扫码登录，随后用 PC 视图获取一篇笔记。"""
+    auth = XHSUnifiedAuth.from_qrcode_login(show_in_terminal=True)
+    try:
+        return _fetch_and_print_pc_note(auth.pc, note_url)
+    finally:
+        auth.close()
 
 
 def pc_phone_login(note_url: str) -> dict[str, Any]:
-    """PC 纯 HTTP 手机验证码登录，随后获取一篇笔记。"""
-    auth = XHSPcAuth.from_phone_login()
-    return _fetch_and_print_pc_note(auth, note_url)
+    """统一手机登录，随后用 PC 视图获取一篇笔记。"""
+    auth = XHSUnifiedAuth.from_phone_login()
+    try:
+        return _fetch_and_print_pc_note(auth.pc, note_url)
+    finally:
+        auth.close()
 
 
 def creator_qrcode_login() -> dict[str, Any]:
-    """Creator 纯 HTTP 二维码登录，随后获取已发布作品列表。"""
-    auth = XHSCreatorAuth.from_qrcode_login(show_in_terminal=True)
-    return _fetch_and_print_creator_notes(auth)
+    """统一扫码登录，随后用 Creator 视图获取已发布作品列表。"""
+    auth = XHSUnifiedAuth.from_qrcode_login(show_in_terminal=True)
+    try:
+        return _fetch_and_print_creator_notes(auth.creator)
+    finally:
+        auth.close()
 
 
 def creator_phone_login() -> dict[str, Any]:
-    """Creator 纯 HTTP 手机验证码登录，随后获取已发布作品列表。"""
-    auth = XHSCreatorAuth.from_phone_login()
-    return _fetch_and_print_creator_notes(auth)
+    """统一手机登录，随后用 Creator 视图获取已发布作品列表。"""
+    auth = XHSUnifiedAuth.from_phone_login()
+    try:
+        return _fetch_and_print_creator_notes(auth.creator)
+    finally:
+        auth.close()
 
 
 # 保留旧入口名，避免已有调用代码失效。

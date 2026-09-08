@@ -1,3 +1,4 @@
+import json
 import random
 import re
 import time
@@ -18,7 +19,12 @@ from xhs_utils.xhs_pc.params import (
     get_common_headers,
     splice_str,
 )
-from xhs_utils.xhs_pc.runtime import generate_profile_data, generate_websectiga
+from xhs_utils.xhs_pc.runtime import (
+    accept_web_ssk,
+    create_web_ssk_handshake,
+    generate_profile_data,
+    generate_websectiga,
+)
 from xhs_utils.xhs_pc.state import (
     PcDeviceProfile,
     REFERENCE_PROFILE,
@@ -159,6 +165,7 @@ class XHSLoginApi:
         tier=None,
         include_trace_headers=True,
         include_b1=None,
+        mns_profile=None,
     ):
         """用同一 PcDeviceProfile 为登录全链生成 MNS/X-S-Common。
 
@@ -167,7 +174,11 @@ class XHSLoginApi:
         验证码/二维码请求复用该值。
         """
         profile = self._ensure_profile(cookies)
-        sign_context = profile.next_sign_context(api, tier=tier)
+        sign_context = profile.next_sign_context(
+            api,
+            tier=tier,
+            mns_profile=mns_profile,
+        )
         if include_b1 is None:
             include_b1 = bool(self._login_b1 or self._webprofile_reported)
         if include_b1 and not self._login_b1:
@@ -214,7 +225,7 @@ class XHSLoginApi:
         )
         self._ensure_profile(cookies)
 
-    def _post_scripting(self, cookies, payload, tier):
+    def _post_scripting(self, cookies, payload, tier, *, mns_profile=None):
         api = '/api/sec/v1/scripting'
         headers, data_str = self._signed_request_params(
             cookies,
@@ -222,6 +233,7 @@ class XHSLoginApi:
             payload,
             sec_domain=True,
             tier=tier,
+            mns_profile=mns_profile,
             include_trace_headers=False,
         )
         wire_cookies = self._cookies_for_url(self.as_url, cookies)
@@ -282,6 +294,7 @@ class XHSLoginApi:
             {},
             sec_domain=True,
             tier='0201',
+            mns_profile='security_initial',
             include_trace_headers=True,
         )
         headers = build_pc_login_headers(
@@ -307,6 +320,7 @@ class XHSLoginApi:
             method='GET',
             sec_domain=True,
             tier='0201',
+            mns_profile='security_initial',
             include_trace_headers=False,
         )
         headers = build_pc_login_headers(headers, None, kind='sem')
@@ -327,6 +341,7 @@ class XHSLoginApi:
             payload,
             sec_domain=True,
             tier='0201',
+            mns_profile='security_initial',
             include_trace_headers=False,
         )
         headers = build_pc_login_headers(
@@ -359,6 +374,7 @@ class XHSLoginApi:
             cookies,
             {"callFrom": "web", "callback": "", "type": "ds", "appId": "xhs-pc-web"},
             tier='0201',
+            mns_profile='security_initial',
         )
         ds_code = str(((ds_res.get('data') or {}).get('data')) or '')
         match = _GETDSS_RE.search(ds_code)
@@ -374,6 +390,7 @@ class XHSLoginApi:
             cookies,
             {"callFrom": "web", "callback": "seccallback"},
             tier='0101',
+            mns_profile='security_callback',
         )
         response_data = sec_res.get('data') or {}
         sec_poison_id = str(response_data.get('secPoisonId') or '')
@@ -391,15 +408,22 @@ class XHSLoginApi:
         self.profile.update_cookies(cookies)
         tiga_time = self.profile.mark_tiga_updated()
         self.profile.session.dsllt = tiga_time
-        # Browser transition confirmed by decoded X-s: seccallback is 0101;
-        # activate, QR, polling and webprofile immediately move to 0301.
-        self.profile.mark_fingerprint_ready(True)
+        # The current browser stays on 0101 for login/activate.  The successful
+        # SSK exchange below is the transition to the 0301 login stage.
 
     def _activate(self, cookies):
         """Create the anonymous visitor session required by both login flows."""
         api = '/api/sns/web/v1/login/activate'
+        handshake = create_web_ssk_handshake()
+        payload = {
+            'client_public_key_base64': handshake['client_public_key_base64'],
+        }
         headers, body = self._signed_request_params(
-            cookies, api, {}, tier='0301',
+            cookies,
+            api,
+            payload,
+            tier='0101',
+            mns_profile='activate',
         )
         headers = build_pc_login_headers(
             headers,
@@ -424,6 +448,18 @@ class XHSLoginApi:
             self.profile.update_cookies(cookies)
         if not cookies.get('web_session'):
             raise RuntimeError('login/activate did not issue visitor web_session')
+        encrypted_ssk = str(data.get('ssk') or '')
+        if not encrypted_ssk:
+            raise RuntimeError('login/activate did not issue encrypted SSK')
+        ssk = accept_web_ssk(handshake['private_key_base64'], encrypted_ssk)
+        web_ssk = json.dumps(
+            {'xhs-pc-web': ssk},
+            ensure_ascii=False,
+            separators=(',', ':'),
+        )
+        self.local_storage['webSsk'] = web_ssk
+        self.profile.update_storage(local_storage=self.local_storage)
+        self.profile.mark_fingerprint_ready(True)
         return data
 
     def _fetch_gid(self, cookies):
@@ -447,6 +483,7 @@ class XHSLoginApi:
             data,
             sec_domain=True,
             tier='0301',
+            mns_profile='webprofile',
             include_trace_headers=False,
             include_b1=True,
         )
@@ -538,7 +575,13 @@ class XHSLoginApi:
         api = '/api/sns/web/v1/login/qrcode/create'
         data = {"qr_type": 1}
 
-        headers, data = self._signed_request_params(cookies, api, data)
+        headers, data = self._signed_request_params(
+            cookies,
+            api,
+            data,
+            tier='0301',
+            mns_profile='qrcode_create',
+        )
         headers = build_pc_login_headers(
             headers,
             self._cookies_for_url(self.base_url, cookies),
@@ -570,7 +613,13 @@ class XHSLoginApi:
         api = '/api/qrcode/userinfo'
         data = {"qrId": qr_id, "code": code}
 
-        headers, data = self._signed_request_params(cookies, api, data)
+        headers, data = self._signed_request_params(
+            cookies,
+            api,
+            data,
+            tier='0301',
+            mns_profile='qrcode_poll',
+        )
         headers = build_pc_login_headers(
             headers,
             self._cookies_for_url(self.base_url, cookies),
@@ -607,7 +656,13 @@ class XHSLoginApi:
         splice_api = splice_str(api, params)
         visitor_session = str(cookies.get('web_session') or '')
 
-        headers, _ = self._signed_request_params(cookies, splice_api, method='GET')
+        headers, _ = self._signed_request_params(
+            cookies,
+            splice_api,
+            method='GET',
+            tier='0301',
+            mns_profile='qrcode_poll',
+        )
         headers['x-login-mode'] = ''
         headers = build_pc_login_headers(
             headers,

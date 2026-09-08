@@ -143,10 +143,12 @@ function buildMiniFields(options = {}) {
     x36: String(options.frameCount ?? 2),
     x37: DEFAULT_X37,
     x38: DEFAULT_X38,
-    // x39 不是 window/global 数量。当前 Chrome 150 浏览器真值为 22；其采集器
-    // 在 SDK 初始化期缓存，纯算层把它作为显式环境输入。
+    // x39 不是 window/global 数量。Creator 4.3.6 的发布页采集器通常
+    // 落在 16-22；纯算层把它作为显式环境输入，历史 fixture 可覆盖。
     x39: String(options.x39 ?? DEFAULT_X39),
-    x42: String(options.sdkVersion ?? '3.5.4'),
+    // Creator's current 4.3.6 collector reports 3.5.6.  Captured fixture
+    // callers can still override x42 explicitly for historical replays.
+    x42: String(options.sdkVersion ?? '3.5.6'),
     x43: String(options.canvasFingerprint ?? 'Canvas not supported'),
     x44: String(now),
     x45: String(options.secCanvas ?? DEFAULT_X45),

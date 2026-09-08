@@ -4,6 +4,56 @@ from xhs_utils.xhs_pc.params import (
 )
 from xhs_utils.xhs_pc.state import PcDeviceProfile, cookie_header
 
+
+PC_CURRENT_BROWSER_UA = (
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+    '(KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36'
+)
+
+
+def get_pugongying_user_info_headers():
+    """Headers captured from Chrome for ``GET /api/solar/user/info``.
+
+    This route is an unsigned bootstrap request.  Keep its minimal wire
+    contract separate from the signed business routes; in particular, empty
+    ``x-s``/``x-t`` and authorization headers are not sent by Chrome.
+    """
+    return {
+        'x-b3-traceid': generate_x_b3_traceid(),
+        'referer': 'https://pgy.xiaohongshu.com/role-introduce?needLogout=needLogout',
+        'user-agent': PC_CURRENT_BROWSER_UA,
+        'accept': 'application/json, text/plain, */*',
+    }
+
+
+def get_pugongying_signed_user_info_headers(
+    *, x_s: str, x_t: str, x_s_common: str, x_b3_traceid: str,
+    referer: str = 'https://pgy.xiaohongshu.com/role-introduce?needLogout=needLogout',
+):
+    """Build the later signed ``user/info`` shape from captured values.
+
+    The browser sends a distinct signed variant after bootstrap.  Signature
+    bytes are intentionally required from the caller; this helper never
+    fabricates or silently drops them.
+    """
+    required = {
+        'x-s': x_s, 'x-t': x_t, 'x-s-common': x_s_common,
+        'x-b3-traceid': x_b3_traceid,
+    }
+    missing = [key for key, value in required.items() if value is None or value == '']
+    if missing:
+        raise ValueError('signed user/info missing captured fields: ' + ', '.join(missing))
+    return {
+        'authorization': '',
+        'referer': str(referer),
+        'x-t': str(x_t),
+        'x-b3-traceid': str(x_b3_traceid),
+        'x-s-common': str(x_s_common),
+        'user-agent': PC_CURRENT_BROWSER_UA,
+        'accept': 'application/json, text/plain, */*',
+        'x-s': str(x_s),
+    }
+
 def get_pugongying_headers_template():
     return {
         "authority": "pgy.xiaohongshu.com",
