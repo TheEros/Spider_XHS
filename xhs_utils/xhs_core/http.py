@@ -63,17 +63,24 @@ def ordered_wire_headers(
         key for key in normalized_order
         if key not in values and key not in optional_names
     ]
-    unexpected = sorted(set(values) - set(normalized_order))
+    # Optional captured headers may be present in a route-specific request
+    # without belonging to the shared canonical order.  Keep them after the
+    # ordered fields rather than rejecting a valid Chrome capture.
+    unexpected = sorted(set(values) - set(normalized_order) - optional_names)
     if missing or (strict and unexpected):
         raise RuntimeError(
             'wire header contract drifted: '
             f'missing={missing}, unexpected={unexpected}'
         )
-    return {
+    result = {
         key: values[key]
         for key in normalized_order
         if key in values
     }
+    for key in values:
+        if key in optional_names and key not in result:
+            result[key] = values[key]
+    return result
 
 
 class BrowserHttpClient:

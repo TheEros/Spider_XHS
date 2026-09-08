@@ -4,12 +4,12 @@
   "release": {
     "appId": "xhs-pc-web",
     "platform": "Windows",
-    "signVersion": "4.3.7",
+    "signVersion": "4.4.3",
     "b1SdkVersion": "3.5.4",
-    "webProfileSdkVersion": "4.3.7",
-    "webBuild": "6.32.2",
-    "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36",
-    "secChUa": "\"Not;A=Brand\";v=\"8\", \"Chromium\";v=\"150\", \"Google Chrome\";v=\"150\""
+    "webProfileSdkVersion": "4.4.3",
+    "webBuild": "6.47.2",
+    "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36",
+    "secChUa": "\"Not;A=Brand\";v=\"8\", \"Chromium\";v=\"152\", \"Google Chrome\";v=\"152\""
   },
   "b1Reference": {
     "frameCount": 2,
@@ -92,7 +92,7 @@
     "timeOriginOffsetMs": -791.9,
     "telemetryTemplate": "{mt:{to:__TIME_ORIGIN__},m:{},k:{},p:{ulr:0,rs:1,ps:1,f:1},st:{h:0,f:1,kr:0},ft:{ae:null,ak:null,cdr:null,bf:null,fi:null}}",
     "fields": {
-      "x1": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36",
+      "x1": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36",
       "x2": "false",
       "x3": "zh-CN",
       "x4": "24",
@@ -215,6 +215,44 @@
       "envConst": 1352,
       "envFpTailHex": "f9416767c9b581635e0744fa8415",
       "evidence": "Fresh isolated PC login page6 webprofile x61; runtime-state dependent"
+    }
+  },
+  "loginMnsProfiles": {
+    "security_initial": {
+      "tier": "0201",
+      "envConst": 1322,
+      "envFpTailHex": "f8536767c9b581635e0744fa8415",
+      "evidence": "Fresh isolated Chrome 152 PC login security chain, 2026-09-06"
+    },
+    "security_callback": {
+      "tier": "0101",
+      "envConst": 1332,
+      "envFpTailHex": "f9526767c9b581635e0744fa8415",
+      "evidence": "Fresh isolated Chrome 152 PC seccallback, 2026-09-06"
+    },
+    "activate": {
+      "tier": "0101",
+      "envConst": 1335,
+      "envFpTailHex": "f9526767c9b581635e0744fa8415",
+      "evidence": "Fresh isolated Chrome 152 PC login activation, 2026-09-06"
+    },
+    "qrcode_create": {
+      "tier": "0301",
+      "envConst": 1350,
+      "envFpTailHex": "f9416767c9b581635e0744fa8415",
+      "evidence": "Fresh isolated Chrome 152 PC QR creation, 2026-09-06"
+    },
+    "qrcode_poll": {
+      "tier": "0301",
+      "envConst": 1351,
+      "envFpTailHex": "f9416767c9b581635e0744fa8415",
+      "evidence": "Fresh isolated Chrome 152 PC QR polling, 2026-09-06"
+    },
+    "webprofile": {
+      "tier": "0301",
+      "envConst": 1358,
+      "envFpTailHex": "f9416767c9b581635e0744fa8415",
+      "evidence": "Fresh isolated Chrome 152 PC webprofile, 2026-09-06"
     }
   },
   "rap": {

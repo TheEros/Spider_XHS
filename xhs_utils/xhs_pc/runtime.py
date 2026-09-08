@@ -24,6 +24,7 @@ _B1_JS = os.path.join(_CORE_JS_DIR, 'b1.js')
 _SIGN_JS = os.path.join(_CORE_JS_DIR, 'sign.js')
 _WEBSECTIGA_CLI = os.path.join(_CORE_JS_DIR, 'websectiga_cli.js')
 _PROFILE_JS = os.path.join(_JS_DIR, 'profile.js')
+_WEB_SSK_JS = os.path.join(_JS_DIR, 'web_ssk.js')
 
 _TIER_GATE = {
     '0101': ('mns0101_', 205),
@@ -100,7 +101,7 @@ def run_signer(
     }
     for key in (
         'now', 'version', 'loadts', 'seq', 'envConst', 'envFpTail', 'webBuild',
-        'signVersion', 'appId', 'platform',
+        'signVersion', 'appId', 'platform', 'deviceTag', 'webSsk',
     ):
         if key in context:
             payload[key] = context[key]
@@ -141,6 +142,59 @@ def run_signer(
             return result
         return None
     return None
+
+
+def _run_web_ssk(payload: Mapping[str, Any], timeout: float = 10.0) -> dict:
+    if not os.path.isfile(_WEB_SSK_JS):
+        raise RuntimeError(f'webSsk helper missing: {_WEB_SSK_JS}')
+    try:
+        proc = subprocess.run(
+            ['node', _WEB_SSK_JS, json.dumps(dict(payload), separators=(',', ':'))],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            cwd=_JS_DIR,
+            encoding='utf-8',
+            errors='replace',
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RuntimeError(f'webSsk helper failed to start: {exc}') from exc
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f'webSsk helper failed: {(proc.stderr or proc.stdout).strip()[:500]}'
+        )
+    try:
+        result = json.loads(proc.stdout.strip())
+    except (json.JSONDecodeError, TypeError) as exc:
+        raise RuntimeError(f'webSsk helper output invalid: {proc.stdout[:300]}') from exc
+    if not isinstance(result, dict):
+        raise RuntimeError('webSsk helper output must be an object')
+    return result
+
+
+def create_web_ssk_handshake(timeout: float = 10.0) -> dict:
+    """Generate the ephemeral X25519 keypair used by PC login activation."""
+    result = _run_web_ssk({'action': 'create'}, timeout=timeout)
+    if not result.get('private_key_base64') or not result.get('client_public_key_base64'):
+        raise RuntimeError('webSsk handshake output is missing key material')
+    return result
+
+
+def accept_web_ssk(
+    private_key_base64: str,
+    encrypted_ssk_base64: str,
+    timeout: float = 10.0,
+) -> str:
+    """Decrypt the activation response SSK with X25519 + AES-256-GCM."""
+    result = _run_web_ssk({
+        'action': 'accept',
+        'private_key_base64': str(private_key_base64),
+        'encrypted_ssk_base64': str(encrypted_ssk_base64),
+    }, timeout=timeout)
+    value = str(result.get('ssk_base64') or '')
+    if not value:
+        raise RuntimeError('webSsk acceptance returned an empty secret')
+    return value
 
 
 def generate_websectiga(
@@ -207,6 +261,7 @@ def generate_profile_data(
     time_origin: Optional[float] = None,
     i12_seed: Optional[int] = None,
     telemetry_fi: Optional[int] = None,
+    exact_fields: bool = False,
     timeout: float = 10.0,
 ) -> str:
     """Pure-calculate PC ``profileData`` from explicit fingerprint fields.
@@ -218,6 +273,8 @@ def generate_profile_data(
     if not os.path.isfile(_PROFILE_JS):
         raise RuntimeError(f'profileData algorithm missing: {_PROFILE_JS}')
     payload: dict[str, Any] = {'fields': dict(fields or {})}
+    if exact_fields:
+        payload['exactFields'] = True
     if timestamp_ms is not None:
         payload['timestampMs'] = int(timestamp_ms)
     if ets is not None:
@@ -260,7 +317,7 @@ def generate_profile_data(
             continue
         value = str(result.get('profileData') or '')
         if (
-            result.get('sdkVersion') == '4.3.7'
+            result.get('sdkVersion') == '4.4.3'
             and int(result.get('length') or 0) == len(value)
             and result.get('algorithm') == 'base64-des-ecb-zero-padding-hex'
             and _PROFILE_DATA_RE.fullmatch(value)
@@ -274,4 +331,7 @@ __all__ = [
     'run_signer',
     'generate_websectiga',
     'generate_profile_data',
+    'create_web_ssk_handshake',
+    'accept_web_ssk',
 ]
+

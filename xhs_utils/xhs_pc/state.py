@@ -428,12 +428,47 @@ class PcDeviceProfile:
             )
         self.session.ensure_tab_device_id()
         self.session.ensure_rwp_fingerprint(started)
+        self.local_storage = local_state
+        self.session_storage = tab_state
+        self._sync_storage_maps()
         if self.b1_state is None:
             self.b1_state = B1RuntimeState.reference(started_at=started)
         if not self.web_build:
             self.web_build = (
                 self._cookie_map.get('webBuild')
                 or str(self.release['webBuild'])
+            )
+        # Chrome Network capture (2026-09, webBuild 6.47.2) reports the
+        # current browser UA and client-hint version.  Keep the historical
+        # fixture profile for older webBuild values while selecting the
+        # captured 152 UA automatically for this release.
+        self._sync_release_for_web_build()
+
+    def _sync_release_for_web_build(self) -> None:
+        """Apply release-specific UA hints after a Cookie/state update."""
+        if str(self.web_build) == '6.47.2':
+            self.release['signVersion'] = '4.4.3'
+            self.release['webProfileSdkVersion'] = '4.4.3'
+            self.release['userAgent'] = (
+                'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+                'AppleWebKit/537.36 (KHTML, like Gecko) '
+                'Chrome/152.0.0.0 Safari/537.36'
+            )
+            self.release['secChUa'] = (
+                '\"Not;A=Brand\";v=\"8\", \"Chromium\";v=\"152\", '
+                '\"Google Chrome\";v=\"152\"'
+            )
+        elif str(self.web_build) == '6.32.2':
+            self.release['signVersion'] = '4.3.7'
+            self.release['webProfileSdkVersion'] = '4.3.7'
+            self.release['userAgent'] = (
+                'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+                'AppleWebKit/537.36 (KHTML, like Gecko) '
+                'Chrome/150.0.0.0 Safari/537.36'
+            )
+            self.release['secChUa'] = (
+                '\"Not;A=Brand\";v=\"8\", \"Chromium\";v=\"150\", '
+                '\"Google Chrome\";v=\"150\"'
             )
 
     @property
@@ -465,6 +500,7 @@ class PcDeviceProfile:
         self.cookies = cookie_header(self._cookie_map)
         if updates.get('webBuild'):
             self.web_build = updates['webBuild']
+            self._sync_release_for_web_build()
         if updates.get('loadts'):
             self.session.loadts = int(updates['loadts'])
         if updates.get('ets'):
@@ -525,13 +561,32 @@ class PcDeviceProfile:
         api: str,
         *,
         tier: Optional[str] = None,
+        mns_profile: Optional[str] = None,
         timestamp_ms: Optional[int] = None,
         version: Optional[int] = None,
     ) -> Dict[str, Any]:
         resolved = self.resolve_mns_tier(api, tier)
-        material = self._stage_for_tier(resolved)
+        if mns_profile:
+            try:
+                material = MnsStageMaterial.from_mapping(
+                    REFERENCE_PROFILE['loginMnsProfiles'][str(mns_profile)]
+                )
+            except KeyError as exc:
+                available = ', '.join(
+                    sorted(REFERENCE_PROFILE.get('loginMnsProfiles', {}))
+                ) or '(none)'
+                raise ValueError(
+                    f'unknown PC MNS profile {mns_profile!r}; available: {available}'
+                ) from exc
+            if material.tier != resolved:
+                raise ValueError(
+                    f'PC MNS profile {mns_profile!r} tier mismatch: '
+                    f'{material.tier} != {resolved}'
+                )
+        else:
+            material = self._stage_for_tier(resolved)
         timestamp = int(timestamp_ms if timestamp_ms is not None else now_ms())
-        return {
+        context = {
             'tier': resolved,
             'now': timestamp,
             'version': int(version if version is not None else secrets.randbits(32)),
@@ -546,6 +601,10 @@ class PcDeviceProfile:
             'userAgent': str(self.release['userAgent']),
             'secChUa': str(self.release['secChUa']),
         }
+        web_ssk = _storage_mapping(self.local_storage).get('webSsk')
+        if web_ssk:
+            context['webSsk'] = web_ssk
+        return context
 
     def current_b1(
         self,
@@ -597,6 +656,25 @@ class PcDeviceProfile:
             options['telemetry_fi'] = int(self.web_profile_fi)
         return options
 
+    def profile_data_from_capture(self, fields: Mapping[str, Any]) -> str:
+        """Encrypt a complete browser-captured profile field map unchanged.
+
+        The caller must supply all fields from one Network request.  This
+        prevents a partial capture from silently mixing browser and local
+        values, which changes ciphertext length and triggers risk controls.
+        """
+        from .runtime import generate_profile_data
+        values = dict(fields or {})
+        expected = set(REFERENCE_PROFILE['webProfile']['fields'])
+        missing = sorted(expected - set(values))
+        extra = sorted(set(values) - expected)
+        if missing or extra:
+            raise ValueError(
+                'captured profile fields schema mismatch: '
+                f'missing={missing}; extra={extra}'
+            )
+        return generate_profile_data(fields=values, exact_fields=True)
+
     def dsl_pair(
         self,
         dsl: str,
@@ -612,16 +690,50 @@ class PcDeviceProfile:
 
     def mark_fingerprint_ready(self, ready: bool = True) -> None:
         self.session.fingerprint_ready = bool(ready)
+        self._sync_storage_maps()
 
     def needs_tiga_refresh(self, timestamp_ms: Optional[int] = None) -> bool:
         timestamp = int(timestamp_ms if timestamp_ms is not None else now_ms())
         return self.session.needs_tiga_refresh(timestamp)
 
     def mark_tiga_updated(self, timestamp_ms: Optional[int] = None) -> int:
-        return self.session.mark_tiga_updated(timestamp_ms)
+        value = self.session.mark_tiga_updated(timestamp_ms)
+        self._sync_storage_maps()
+        return value
 
     def mark_profile_reported(self) -> int:
-        return self.session.mark_profile_reported()
+        value = self.session.mark_profile_reported()
+        self._sync_storage_maps()
+        return value
+
+    def _sync_storage_maps(self) -> None:
+        local_state = _storage_mapping(self.local_storage)
+        local_state.update({
+            'dsllt': str(int(self.session.dsllt)),
+            'last_tiga_update_time': str(int(self.session.last_tiga_update_time)),
+            'p1': str(int(self.session.profile_count)),
+            'sc': str(int(self.session.sign_count)),
+        })
+        if self.session.rwp_login_token:
+            local_state['RWP_LOGIN_TOKEN'] = json.dumps(
+                self.session.rwp_login_token,
+                ensure_ascii=False,
+                separators=(',', ':'),
+            )
+        elif 'RWP_LOGIN_TOKEN' in local_state:
+            local_state['RWP_LOGIN_TOKEN'] = ''
+        tab_state = _storage_mapping(self.session_storage)
+        tab_state.update({
+            'XHS_TAB_DEVICE_ID': self.session.ensure_tab_device_id(),
+            'XHS_RWP_FINGERPRINT': self.session.ensure_rwp_fingerprint(),
+        })
+        self.local_storage = local_state
+        self.session_storage = tab_state
+
+    def browser_storage_snapshot(self) -> tuple[Dict[str, Any], Dict[str, Any]]:
+        """Return generated browser storage state without exposing internals."""
+        self._sync_storage_maps()
+        return dict(self.local_storage), dict(self.session_storage)
 
     def update_storage(
         self,
@@ -630,6 +742,14 @@ class PcDeviceProfile:
     ) -> None:
         local_state = _storage_mapping(local_storage or {})
         tab_state = _storage_mapping(session_storage or {})
+        if local_storage is not None:
+            merged_local = _storage_mapping(self.local_storage)
+            merged_local.update(local_state)
+            self.local_storage = merged_local
+        if session_storage is not None:
+            merged_session = _storage_mapping(self.session_storage)
+            merged_session.update(tab_state)
+            self.session_storage = merged_session
         if local_state.get('dsllt'):
             self.session.dsllt = int(local_state['dsllt'])
         if local_state.get('last_tiga_update_time'):
@@ -640,9 +760,9 @@ class PcDeviceProfile:
             self.session.profile_count = int(local_state['p1'])
         if local_state.get('sc') is not None:
             self.session.sign_count = int(local_state['sc'])
-        if local_state.get('RWP_LOGIN_TOKEN'):
+        if 'RWP_LOGIN_TOKEN' in local_state:
             self.session.rwp_login_token = _json_object(
-                local_state['RWP_LOGIN_TOKEN']
+                local_state.get('RWP_LOGIN_TOKEN') or {}
             )
         if tab_state.get('XHS_TAB_DEVICE_ID'):
             self.session.tab_device_id = str(tab_state['XHS_TAB_DEVICE_ID'])
@@ -650,6 +770,7 @@ class PcDeviceProfile:
             self.session.rwp_fingerprint = str(
                 tab_state['XHS_RWP_FINGERPRINT']
             )
+        self._sync_storage_maps()
 
     def state_snapshot(self) -> Dict[str, Any]:
         snapshot = self.session.snapshot()

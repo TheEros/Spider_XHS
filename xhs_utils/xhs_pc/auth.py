@@ -258,7 +258,13 @@ class XHSPcAuth(XHSAuth):
         self._set_dsl(self.dsl)
         self.web_build = str(self.profile.web_build)
         self._user_id_ready = bool(self.user_id)
+        self._sync_storage_from_profile()
         self.validate()
+
+    def _sync_storage_from_profile(self) -> None:
+        local, session = self.profile.browser_storage_snapshot()
+        self.local_storage = local
+        self.session_storage = session
 
     def validate(self, require_user_id: bool = False) -> None:
         cookies = self.profile.cookie_map
@@ -304,9 +310,17 @@ class XHSPcAuth(XHSAuth):
         self,
         api: str,
         tier: Optional[str] = None,
+        mns_profile: Optional[str] = None,
         timestamp_ms: Optional[int] = None,
     ) -> dict:
-        return self.profile.next_sign_context(api, tier=tier, timestamp_ms=timestamp_ms)
+        context = self.profile.next_sign_context(
+            api,
+            tier=tier,
+            mns_profile=mns_profile,
+            timestamp_ms=timestamp_ms,
+        )
+        self._sync_storage_from_profile()
+        return context
 
     def update_cookies(self, cookies: Any, *, source_url: str = '') -> None:
         values = self.profile.cookie_map
@@ -319,6 +333,7 @@ class XHSPcAuth(XHSAuth):
         self.profile.update_cookies(values)
         self.cookies = cookie_header(self.profile.cookie_map)
         self.host_cookies = self._cookie_store.snapshot()
+        self._sync_storage_from_profile()
 
     def update_runtime_state(
         self,
@@ -349,7 +364,16 @@ class XHSPcAuth(XHSAuth):
         if web_profile_fi is not None:
             self.web_profile_fi = int(web_profile_fi)
             self.profile.web_profile_fi = self.web_profile_fi
+        if local_storage is not None:
+            merged_local = dict(self.local_storage or {})
+            merged_local.update(dict(local_storage))
+            self.local_storage = merged_local
+        if session_storage is not None:
+            merged_session = dict(self.session_storage or {})
+            merged_session.update(dict(session_storage))
+            self.session_storage = merged_session
         self.profile.update_storage(local_storage, session_storage)
+        self._sync_storage_from_profile()
         return self
 
     def update_browser_state(
@@ -369,7 +393,9 @@ class XHSPcAuth(XHSAuth):
                 proxies=self.proxies,
                 http_client=self.http_client,
             )
-        return self.profile.dsl_pair(value)
+        pair = self.profile.dsl_pair(value)
+        self._sync_storage_from_profile()
+        return pair
 
     def refresh_dsl(self) -> str:
         from .dsl import get_dsl
@@ -418,18 +444,24 @@ class XHSPcAuth(XHSAuth):
         ``document.cookie``.
         """
         auth_kwargs['login_source'] = 'cookie'
-        return cls(
+        auth = cls(
             cookies=cookies,
             _factory_token=_AUTH_FACTORY_TOKEN,
             **auth_kwargs,
         )
+        # Resolve the authenticated user id immediately so every business
+        # API can be used without a second manual bootstrap step.
+        from apis.xhs_pc_apis import XHS_Apis
+        XHS_Apis(auth).bootstrap()
+        return auth
 
     @classmethod
     def from_qrcode_login(
         cls,
         *,
         show_in_terminal: bool = True,
-        **auth_kwargs,
+        proxies: Optional[dict] = None,
+        http_client: Optional[PcHttpClient] = None,
     ) -> 'XHSPcAuth':
         """Login through the local QR API flow and return a ready Auth object.
 
@@ -438,23 +470,10 @@ class XHSPcAuth(XHSAuth):
         """
         from apis.xhs_pc_login_apis import XHSLoginApi
 
-        http_client = auth_kwargs.get('http_client') or PcHttpClient(
-            proxies=auth_kwargs.get('proxies')
-        )
+        http_client = http_client or PcHttpClient(proxies=proxies)
         login = XHSLoginApi(
-            proxies=auth_kwargs.get('proxies'),
+            proxies=proxies,
             http_client=http_client,
-            b1=auth_kwargs.get('b1'),
-            dsl=auth_kwargs.get('dsl'),
-            local_storage=auth_kwargs.get('local_storage'),
-            session_storage=auth_kwargs.get('session_storage'),
-            b1_state=auth_kwargs.get('b1_state'),
-            web_build=auth_kwargs.get('web_build'),
-            mns_env=auth_kwargs.get('mns_env'),
-            rap_fingerprint_hex=auth_kwargs.get('rap_fingerprint_hex'),
-            web_profile_fields=auth_kwargs.get('web_profile_fields'),
-            web_profile_i12_seed=auth_kwargs.get('web_profile_i12_seed'),
-            web_profile_fi=auth_kwargs.get('web_profile_fi'),
         )
         cookies = login.qrcode_login(
             show_in_terminal=show_in_terminal
@@ -462,54 +481,54 @@ class XHSPcAuth(XHSAuth):
         if not cookies:
             http_client.close()
             raise RuntimeError('XHS QR login did not return an authenticated Cookie')
-        auth_kwargs['login_source'] = 'qrcode'
-        auth_kwargs['http_client'] = http_client
-        auth_kwargs['host_cookies'] = login.host_cookies_snapshot()
-        auth_kwargs['host_cookie_state'] = login.host_cookie_state()
-        auth_kwargs['cookie_source_url'] = PC_PLATFORM_CONFIG.origin('api')
-        return cls(
+        auth = cls(
             cookies=cookies,
+            login_source='qrcode',
+            proxies=proxies,
+            http_client=http_client,
+            host_cookies=login.host_cookies_snapshot(),
+            host_cookie_state=login.host_cookie_state(),
+            cookie_source_url=PC_PLATFORM_CONFIG.origin('api'),
+            profile=login.profile,
             _factory_token=_AUTH_FACTORY_TOKEN,
-            **auth_kwargs,
         )
+        from apis.xhs_pc_apis import XHS_Apis
+        XHS_Apis(auth).bootstrap()
+        return auth
 
     @classmethod
-    def from_phone_login(cls, **auth_kwargs) -> 'XHSPcAuth':
+    def from_phone_login(
+        cls,
+        *,
+        proxies: Optional[dict] = None,
+        http_client: Optional[PcHttpClient] = None,
+    ) -> 'XHSPcAuth':
         """Login through the local SMS API flow without using a browser."""
         from apis.xhs_pc_login_apis import XHSLoginApi
 
-        http_client = auth_kwargs.get('http_client') or PcHttpClient(
-            proxies=auth_kwargs.get('proxies')
-        )
+        http_client = http_client or PcHttpClient(proxies=proxies)
         login = XHSLoginApi(
-            proxies=auth_kwargs.get('proxies'),
+            proxies=proxies,
             http_client=http_client,
-            b1=auth_kwargs.get('b1'),
-            dsl=auth_kwargs.get('dsl'),
-            local_storage=auth_kwargs.get('local_storage'),
-            session_storage=auth_kwargs.get('session_storage'),
-            b1_state=auth_kwargs.get('b1_state'),
-            web_build=auth_kwargs.get('web_build'),
-            mns_env=auth_kwargs.get('mns_env'),
-            rap_fingerprint_hex=auth_kwargs.get('rap_fingerprint_hex'),
-            web_profile_fields=auth_kwargs.get('web_profile_fields'),
-            web_profile_i12_seed=auth_kwargs.get('web_profile_i12_seed'),
-            web_profile_fi=auth_kwargs.get('web_profile_fi'),
         )
         cookies = login.phone_login()
         if not cookies:
             http_client.close()
             raise RuntimeError('XHS phone login did not return an authenticated Cookie')
-        auth_kwargs['login_source'] = 'phone'
-        auth_kwargs['http_client'] = http_client
-        auth_kwargs['host_cookies'] = login.host_cookies_snapshot()
-        auth_kwargs['host_cookie_state'] = login.host_cookie_state()
-        auth_kwargs['cookie_source_url'] = PC_PLATFORM_CONFIG.origin('api')
-        return cls(
+        auth = cls(
             cookies=cookies,
+            login_source='phone',
+            proxies=proxies,
+            http_client=http_client,
+            host_cookies=login.host_cookies_snapshot(),
+            host_cookie_state=login.host_cookie_state(),
+            cookie_source_url=PC_PLATFORM_CONFIG.origin('api'),
+            profile=login.profile,
             _factory_token=_AUTH_FACTORY_TOKEN,
-            **auth_kwargs,
         )
+        from apis.xhs_pc_apis import XHS_Apis
+        XHS_Apis(auth).bootstrap()
+        return auth
 
     def _set_dsl(self, value: str) -> None:
         text = str(value or '')

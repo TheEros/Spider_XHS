@@ -48,5 +48,6 @@ _live_session.json
 # Local reverse-engineering scratch spaces. Durable conclusions stay in local docs/.
 /reverse_pc_*/
 /source/
+/_scratch/
 
 creator_cookie.json

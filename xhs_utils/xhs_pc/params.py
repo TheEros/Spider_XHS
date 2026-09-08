@@ -13,8 +13,13 @@ from xhs_utils.xhs_core.http import ordered_wire_headers
 PC_LOGIN_ACCEPT_LANGUAGE = 'zh-CN,zh;q=0.9'
 PC_BUSINESS_ACCEPT_LANGUAGE = 'zh-CN,zh;q=0.9,en;q=0.8,zh-TW;q=0.7,ja;q=0.6'
 PC_SEC_CH_UA = (
-    '"Not;A=Brand";v="8", "Chromium";v="150", '
-    '"Google Chrome";v="150"'
+    '"Not;A=Brand";v="8", "Chromium";v="152", '
+    '"Google Chrome";v="152"'
+)
+
+PC_CURRENT_BROWSER_UA = (
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+    '(KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36'
 )
 
 PC_NAVIGATION_HEADER_ORDER = (
@@ -55,20 +60,52 @@ PC_SIGNED_GET_HEADER_ORDER = (
     'cookie', 'origin', 'priority', 'sec-fetch-dest', 'sec-fetch-mode',
     'sec-fetch-site',
 )
+PC_BUSINESS_SIGNED_POST_HEADER_ORDER = (
+    'referer', 'x-xray-traceid', 'x-t', 'x-b3-traceid', 'x-s-common',
+    'user-agent', 'accept', 'content-type', 'x-s', 'accept-encoding',
+    'accept-language', 'cookie', 'origin', 'priority', 'sec-fetch-dest',
+    'sec-fetch-mode', 'sec-fetch-site',
+)
+PC_BUSINESS_SIGNED_GET_HEADER_ORDER = (
+    'referer', 'x-xray-traceid', 'x-t', 'x-b3-traceid', 'x-s-common',
+    'user-agent', 'accept', 'x-s', 'accept-encoding', 'accept-language',
+    'cookie', 'origin', 'priority', 'sec-fetch-dest', 'sec-fetch-mode',
+    'sec-fetch-site',
+)
+PC_BUSINESS_CDEVICE_GET_HEADER_ORDER = (
+    'referer', 'x-xray-traceid', 'c_device_id', 'x-t', 'x-b3-traceid',
+    'x-s-common', 'user-agent', 'accept', 'x-s', 'accept-encoding',
+    'accept-language', 'cookie', 'origin', 'priority', 'sec-fetch-dest',
+    'sec-fetch-mode', 'sec-fetch-site',
+)
+PC_LIVE_POST_HEADER_ORDER = (
+    'referer', 'xy-common-params', 'x-t', 'x-s-common',
+    'x-ratelimit-meta', 'accept', 'content-type', 'x-s', 'user-agent',
+    'accept-encoding', 'accept-language', 'cookie', 'origin', 'priority',
+    'sec-fetch-dest', 'sec-fetch-mode', 'sec-fetch-site',
+)
+PC_LIVE_GET_HEADER_ORDER = (
+    'referer', 'xy-common-params', 'x-t', 'x-s-common',
+    'x-ratelimit-meta', 'accept', 'x-s', 'user-agent', 'accept-encoding',
+    'accept-language', 'cookie', 'origin', 'priority', 'sec-fetch-dest',
+    'sec-fetch-mode', 'sec-fetch-site',
+)
 PC_RAP_POST_HEADER_ORDER = (
-    'sec-ch-ua-platform', 'referer', 'sec-ch-ua', 'x-xray-traceid',
-    'sec-ch-ua-mobile', 'x-t', 'x-b3-traceid', 'x-s-common',
+    'referer', 'x-xray-traceid', 'x-t', 'x-b3-traceid', 'x-s-common',
     'x-rap-param', 'accept', 'content-type', 'x-s', 'user-agent',
     'accept-encoding', 'accept-language', 'cookie', 'origin', 'priority',
     'sec-fetch-dest', 'sec-fetch-mode', 'sec-fetch-site',
 )
 PC_XY_RAP_POST_HEADER_ORDER = (
-    'sec-ch-ua-platform', 'xy-direction',
-) + PC_RAP_POST_HEADER_ORDER[1:]
+    # Chrome's homefeed/feed requests place the sharding header first.
+    'xy-direction', 'referer', 'x-xray-traceid', 'x-t', 'x-b3-traceid',
+    'x-s-common', 'x-rap-param', 'accept', 'content-type', 'x-s',
+    'user-agent', 'accept-encoding', 'accept-language', 'cookie', 'origin',
+    'priority', 'sec-fetch-dest', 'sec-fetch-mode', 'sec-fetch-site',
+)
 PC_RAP_GET_HEADER_ORDER = (
-    'sec-ch-ua-platform', 'referer', 'sec-ch-ua', 'x-xray-traceid',
-    'sec-ch-ua-mobile', 'x-t', 'x-rap-param', 'x-b3-traceid',
-    'x-s-common', 'user-agent', 'accept', 'x-s', 'accept-encoding',
+    'referer', 'x-xray-traceid', 'x-t', 'x-b3-traceid', 'x-s-common',
+    'x-rap-param', 'user-agent', 'accept', 'x-s', 'accept-encoding',
     'accept-language', 'cookie', 'origin', 'priority', 'sec-fetch-dest',
     'sec-fetch-mode', 'sec-fetch-site',
 )
@@ -249,7 +286,7 @@ def get_common_headers():
         'user-agent': (
             'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
             'AppleWebKit/537.36 (KHTML, like Gecko) '
-            'Chrome/150.0.0.0 Safari/537.36'
+            'Chrome/152.0.0.0 Safari/537.36'
         ),
         'sec-ch-ua': PC_SEC_CH_UA,
         'sec-ch-ua-mobile': '?0',
@@ -328,21 +365,18 @@ def get_request_headers_template(
     method='POST',
     accept_language=PC_BUSINESS_ACCEPT_LANGUAGE,
     has_body=None,
+    include_client_hints=True,
+    include_trace_headers=True,
 ):
     context = sign_context or {}
     user_agent = context.get(
         'userAgent',
         'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
-        '(KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36',
+        '(KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36',
     )
     headers = {
-        'sec-ch-ua-platform': '"Windows"',
         'referer': 'https://www.xiaohongshu.com/',
-        'sec-ch-ua': context.get('secChUa', PC_SEC_CH_UA),
-        'x-xray-traceid': generate_xray_traceid(),
-        'sec-ch-ua-mobile': '?0',
         'x-t': '',
-        'x-b3-traceid': '',
         'x-s-common': '',
         'user-agent': user_agent,
         'accept': 'application/json, text/plain, */*',
@@ -354,6 +388,13 @@ def get_request_headers_template(
         'sec-fetch-mode': 'cors',
         'sec-fetch-site': 'same-site',
     }
+    if include_trace_headers:
+        headers['x-xray-traceid'] = generate_xray_traceid()
+        headers['x-b3-traceid'] = ''
+    if include_client_hints:
+        headers['sec-ch-ua-platform'] = '"Windows"'
+        headers['sec-ch-ua'] = context.get('secChUa', PC_SEC_CH_UA)
+        headers['sec-ch-ua-mobile'] = '?0'
     if has_body is None:
         has_body = str(method).upper() != 'GET'
     if has_body:
@@ -394,7 +435,23 @@ def build_pc_business_headers(headers, cookies, *, api, method='POST'):
     upper_method = str(method).upper()
     has_rap = 'x-rap-param' in {str(key).lower() for key in headers}
     has_xy = 'xy-direction' in {str(key).lower() for key in headers}
-    if has_xy:
+    has_client_hints = 'sec-ch-ua-platform' in {str(key).lower() for key in headers}
+    has_device_header = 'c_device_id' in {str(key).lower() for key in headers}
+    if not has_client_hints and has_device_header:
+        order = PC_BUSINESS_CDEVICE_GET_HEADER_ORDER
+    elif not has_client_hints and has_xy:
+        order = PC_XY_RAP_POST_HEADER_ORDER
+    elif not has_client_hints and has_rap and upper_method == 'GET':
+        order = PC_RAP_GET_HEADER_ORDER
+    elif not has_client_hints and has_rap:
+        order = PC_RAP_POST_HEADER_ORDER
+    elif not has_client_hints and not has_rap and not has_xy:
+        order = (
+            PC_BUSINESS_SIGNED_GET_HEADER_ORDER
+            if upper_method == 'GET'
+            else PC_BUSINESS_SIGNED_POST_HEADER_ORDER
+        )
+    elif has_xy:
         order = PC_XY_RAP_POST_HEADER_ORDER
     elif has_rap and upper_method == 'GET':
         order = PC_RAP_GET_HEADER_ORDER
@@ -406,12 +463,45 @@ def build_pc_business_headers(headers, cookies, *, api, method='POST'):
         order = PC_SIGNED_POST_HEADER_ORDER
     if 'content-type' not in {str(key).lower() for key in headers}:
         order = tuple(key for key in order if key != 'content-type')
-    return ordered_wire_headers(headers, order=order, cookies=cookies)
+    # Message-page bootstrap captures include these cache controls in this
+    # exact relative position.
+    lower_keys = {str(key).lower() for key in headers}
+    order = list(order)
+    if 'cache-control' in lower_keys and 'cache-control' not in order:
+        anchor = order.index('cookie') if 'cookie' in order else order.index('origin')
+        order.insert(anchor, 'cache-control')
+    if 'pragma' in lower_keys and 'pragma' not in order:
+        anchor = order.index('priority') if 'priority' in order else len(order)
+        order.insert(anchor, 'pragma')
+    return ordered_wire_headers(
+        headers,
+        order=tuple(order),
+        cookies=cookies,
+    )
+
+
+def build_pc_live_headers(headers, cookies, *, method='POST'):
+    """Build the separate live-room header contract captured in Chrome.
+
+    Live-room requests currently omit client-hint and trace headers.  The
+    live page places ``xy-common-params`` immediately after the referer and
+    ``x-ratelimit-meta`` before ``accept``.
+    """
+    order = PC_LIVE_GET_HEADER_ORDER if str(method).upper() == 'GET' else PC_LIVE_POST_HEADER_ORDER
+    if 'content-type' not in {str(key).lower() for key in headers}:
+        order = tuple(key for key in order if key != 'content-type')
+    return ordered_wire_headers(
+        headers,
+        order=order,
+        cookies=cookies,
+        optional=('xy-common-params', 'x-ratelimit-meta'),
+    )
 
 def generate_headers(
     a1, api, data='', method='POST', user_id: str = '', cookie: str = '',
     b1=None, dsl_pair=None, with_xy_direction: bool = False,
     tier=None, sign_context=None,
+    include_client_hints=True, include_trace_headers=True,
 ):
     # user_id 用于可选 xy-direction；签名材料仍强制在 generate_xs_xs_common / generate_request_params 校验
     xs, xt, xs_common = generate_xs_xs_common(
@@ -423,6 +513,8 @@ def generate_headers(
         sign_context,
         method=method,
         has_body=data not in ('', None),
+        include_client_hints=include_client_hints,
+        include_trace_headers=include_trace_headers,
     )
     headers['x-s'] = xs
     headers['x-t'] = str(xt)
@@ -445,6 +537,7 @@ def generate_request_params(
     cookies_str, api, data='', method='POST', user_id: str = '', b1=None,
     dsl_pair=None, doc_cookie: str = '', with_xy_direction: bool = False,
     tier=None, sign_context=None,
+    include_client_hints=True, include_trace_headers=True,
 ):
     # Network Cookie 已含 a1 时可直接复用，不必再传一份 document.cookie
     sign_cookie = doc_cookie or cookies_str
@@ -465,6 +558,8 @@ def generate_request_params(
         a1, api, data, method, user_id=user_id,
         cookie=sign_cookie, b1=b1, dsl_pair=dsl_pair,
         with_xy_direction=with_xy_direction, tier=tier, sign_context=sign_context,
+        include_client_hints=include_client_hints,
+        include_trace_headers=include_trace_headers,
     )
     return headers, cookies, data
 
@@ -489,9 +584,11 @@ __all__ = [
     'PC_LOGIN_ACCEPT_LANGUAGE',
     'PC_BUSINESS_ACCEPT_LANGUAGE',
     'PC_SEC_CH_UA',
+    'PC_CURRENT_BROWSER_UA',
     'build_pc_navigation_headers',
     'build_pc_login_headers',
     'build_pc_business_headers',
+    'build_pc_live_headers',
     'generate_xy_direction',
     'murmur_hash3_32',
     'get_request_headers_template',

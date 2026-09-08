@@ -59,6 +59,7 @@ PC_PLATFORM_CONFIG = XHSPlatformConfig(
         'web': 'https://www.xiaohongshu.com',
         'api': 'https://edith.xiaohongshu.com',
         'search': 'https://so.xiaohongshu.com',
+        'live': 'https://live-room.xiaohongshu.com',
         'login': 'https://www.xiaohongshu.com',
         'security': 'https://as.xiaohongshu.com',
         'captcha': 'https://edith.xiaohongshu.com',

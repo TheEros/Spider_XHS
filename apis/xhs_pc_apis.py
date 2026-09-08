@@ -1,6 +1,7 @@
 # encoding: utf-8
 import json
 import re
+import time
 import urllib
 from xhs_utils.xhs_pc import XHSAuth, XHSPcAuth
 from xhs_utils.xhs_pc.http import PcHttpClient
@@ -12,6 +13,7 @@ from xhs_utils.xhs_pc.params import (
     generate_search_request_id,
     generate_search_session_id,
     generate_x_rap_param,
+    PC_CURRENT_BROWSER_UA,
     get_common_headers,
     splice_str,
 )
@@ -31,6 +33,22 @@ def _get_query_params(parsed_url):
         key: values[-1] if values else ''
         for key, values in urllib.parse.parse_qs(parsed_url.query, keep_blank_values=True).items()
     }
+
+
+def _insert_header_after(headers, key, value, after):
+    """Insert a captured header at its observed wire position."""
+    out = {}
+    inserted = False
+    for name, current in headers.items():
+        if name.lower() == key.lower():
+            continue
+        out[name] = current
+        if name.lower() == after.lower():
+            out[key] = value
+            inserted = True
+    if not inserted:
+        out[key] = value
+    return out
 
 
 # RAP 白名单（浏览器实抓：需 x-rap-param）
@@ -130,8 +148,19 @@ class XHS_Apis():
             with_xy_direction=self._needs_xy(api),
             tier=sign_context['tier'],
             sign_context=sign_context,
+            include_client_hints=False,
         )
         headers.pop("x-mns", None)
+        # Chrome's message-page bootstrap marks these cacheable GET/empty-POST
+        # endpoints explicitly.  They are conditional: ordinary feed and
+        # notification calls do not carry the two fields.
+        if api.split('?', 1)[0] in {
+            '/api/sns/web/v1/config',
+            '/api/sns/web/v1/system/config',
+            '/api/sns/web/v2/user/me',
+        }:
+            headers['cache-control'] = 'no-cache'
+            headers['pragma'] = 'no-cache'
         if self._needs_rap(api):
             headers["x-rap-param"] = generate_x_rap_param(
                 api,
@@ -149,6 +178,10 @@ class XHS_Apis():
             api=api,
             method=method,
         )
+        # Preserve the UA tied to the captured release/session.  The current
+        # default is Chrome 152, while explicit historical fixtures may carry
+        # Chrome 150; never overwrite a captured context here.
+        headers['user-agent'] = sign_context.get('userAgent', PC_CURRENT_BROWSER_UA)
         return headers, wire_cookies, body
 
     def get_homefeed_all_channel(self, proxies: dict = None):
@@ -502,6 +535,123 @@ class XHS_Apis():
             msg = _log_api_error(e)
         return success, msg, res_json
 
+    @staticmethod
+    def _captured_json_body(data, required, *, operation):
+        """Return a browser-captured JSON mapping with an exact field contract.
+
+        Insertion order is retained because it is part of the signed wire
+        body.  These helpers intentionally reject partial payloads instead of
+        silently relying on server defaults, which can trigger risk control.
+        """
+        if not isinstance(data, dict):
+            raise TypeError(f'{operation} requires a mapping body')
+        missing = [key for key in required if key not in data]
+        if missing:
+            raise ValueError(
+                f'{operation} missing captured fields: {", ".join(missing)}'
+            )
+        return {key: data[key] for key in data}
+
+    def share_code(self, note_id: str, proxies: dict = None):
+        """Generate a note share code using the captured one-field body."""
+        if not note_id:
+            raise ValueError('share_code requires captured note_id')
+        data = self._captured_json_body(
+            {'share_code': {'id': str(note_id)}},
+            ('share_code',),
+            operation='share_code',
+        )
+        api = '/api/sns/web/share/code'
+        headers, cookies, body = self._request_params(api, data, 'POST')
+        response = self.http.post(
+            self.base_url + api, headers=headers, data=body,
+            cookies=cookies, proxies=self._proxies(proxies),
+            timeout=REQUEST_TIMEOUT,
+        )
+        return response.json()
+
+    def get_widgets(self, note_id: str, *, source: str = 'web_feed',
+                    mode: int = 1, exp_flags: dict | None = None,
+                    proxies: dict = None):
+        """Fetch note widgets with the complete captured request shape."""
+        if not note_id:
+            raise ValueError('get_widgets requires captured note_id')
+        if exp_flags is None:
+            exp_flags = {'web_support_related_search': True}
+        data = self._captured_json_body(
+            {'note_id': str(note_id), 'scene': 'web', 'mode': int(mode),
+             'source': str(source), 'exp_flags': exp_flags},
+            ('note_id', 'scene', 'mode', 'source', 'exp_flags'),
+            operation='get_widgets',
+        )
+        api = '/api/sns/web/v2/widgets'
+        headers, cookies, body = self._request_params(api, data, 'POST')
+        response = self.http.post(
+            self.base_url + api, headers=headers, data=body,
+            cookies=cookies, proxies=self._proxies(proxies),
+            timeout=REQUEST_TIMEOUT,
+        )
+        return response.json()
+
+    def worldcup_note_seo(self, note_ids, proxies: dict = None):
+        """Fetch SEO/indexability state using Chrome's ordered body.
+
+        The browser sends ``{"note_ids":[...]}`` even for a single note;
+        callers must provide a non-empty captured list so the signed body
+        cannot silently fall back to a server default.
+        """
+        if not isinstance(note_ids, (list, tuple)) or not note_ids:
+            raise ValueError('worldcup_note_seo requires captured note_ids')
+        data = self._captured_json_body(
+            {'note_ids': [str(value) for value in note_ids]},
+            ('note_ids',), operation='worldcup_note_seo',
+        )
+        api = '/api/sns/web/worldcup/note/seo'
+        headers, cookies, body = self._request_params(api, data, 'POST')
+        response = self.http.post(
+            self.base_url + api, headers=headers, data=body,
+            cookies=cookies, proxies=self._proxies(proxies),
+            timeout=REQUEST_TIMEOUT,
+        )
+        return response.json()
+
+    def report_note_metrics(self, data: dict, proxies: dict = None):
+        """Report note-view metrics using a complete captured body."""
+        required = (
+            'note_id', 'note_type', 'report_type', 'stress_test', 'trace',
+            'viewer', 'author', 'interaction', 'note', 'other',
+        )
+        payload = self._captured_json_body(
+            data, required, operation='report_note_metrics'
+        )
+        api = '/api/sns/web/v1/note/metrics_report'
+        headers, cookies, body = self._request_params(api, payload, 'POST')
+        response = self.http.post(
+            self.base_url + api, headers=headers, data=body,
+            cookies=cookies, proxies=self._proxies(proxies),
+            timeout=REQUEST_TIMEOUT,
+        )
+        return response.json()
+
+    def report_history_web(self, data: dict, proxies: dict = None):
+        """Report web history events using the captured event envelope."""
+        payload = self._captured_json_body(
+            data, ('events', 'extra_map'), operation='report_history_web'
+        )
+        api = '/api/sns/v1/history/report_web'
+        headers, cookies, body = self._request_params(api, payload, 'POST')
+        # Chrome uses the generic JSON media type for this endpoint.
+        headers['content-type'] = 'application/json'
+        headers = build_pc_business_headers(
+            headers, cookies, api=api, method='POST'
+        )
+        response = self.http.post(
+            self.base_url + api, headers=headers, data=body,
+            cookies=cookies, proxies=self._proxies(proxies),
+            timeout=REQUEST_TIMEOUT,
+        )
+        return response.json()
+
 
     def get_search_keyword(self, word: str, proxies: dict = None):
         """
@@ -522,6 +672,258 @@ class XHS_Apis():
             success = False
             msg = _log_api_error(e)
         return success, msg, res_json
+
+    def get_web_config(self, proxies: dict = None):
+        """Fetch the PC web config (POST with the browser's empty body)."""
+        res_json = None
+        try:
+            api = "/api/sns/web/v1/config"
+            headers, cookies, body = self._request_params(api, '', 'POST')
+            # Chrome sends content-length: 0 here; do not serialize an empty
+            # JSON object or add a synthetic field.
+            response = self.http.post(
+                self.base_url + api, headers=headers,
+                data=body.encode("utf-8") if body else b"",
+                cookies=cookies, proxies=self._proxies(proxies),
+                timeout=REQUEST_TIMEOUT,
+            )
+            self._merge_response_cookies(response, self.base_url + api)
+            res_json = response.json()
+            success, msg = res_json["success"], res_json["msg"]
+        except Exception as e:
+            success = False
+            msg = _log_api_error(e)
+        return success, msg, res_json
+
+    def get_system_config(self, proxies: dict = None):
+        """Fetch the system config endpoint observed during PC bootstrap."""
+        res_json = None
+        try:
+            api = "/api/sns/web/v1/system/config"
+            headers, cookies, _ = self._request_params(api, '', 'GET')
+            target = self.base_url + api
+            response = self.http.get(
+                target, headers=headers, cookies=cookies,
+                proxies=self._proxies(proxies), timeout=REQUEST_TIMEOUT,
+            )
+            self._merge_response_cookies(response, target)
+            res_json = response.json()
+            success, msg = res_json["success"], res_json["msg"]
+        except Exception as e:
+            success = False
+            msg = _log_api_error(e)
+        return success, msg, res_json
+
+    def get_trending_queries(
+        self,
+        *,
+        source: str = "UserPage",
+        search_type: str = "trend",
+        last_query: str = "",
+        last_query_time: int = 0,
+        word_request_situation: str = "FIRST_ENTER",
+        hint_word: str = "",
+        hint_word_type: str = "",
+        hint_word_request_id: str = "",
+        proxies: dict = None,
+    ):
+        """Fetch trending queries with the captured query-field order."""
+        params = {
+            "source": source,
+            "search_type": search_type,
+            "last_query": last_query,
+            "last_query_time": last_query_time,
+            "word_request_situation": word_request_situation,
+            "hint_word": hint_word,
+            "hint_word_type": hint_word_type,
+            "hint_word_request_id": hint_word_request_id,
+        }
+        api = splice_str("/api/sns/web/v1/search/trending/query", params)
+        headers, cookies, _ = self._request_params(api, "", "GET")
+        target = self.base_url + api
+        response = self.http.get(
+            target, headers=headers, cookies=cookies,
+            proxies=self._proxies(proxies), timeout=REQUEST_TIMEOUT,
+        )
+        self._merge_response_cookies(response, target)
+        return response.json()
+
+    def get_celestial_lt(self, *, device_id: str, proxies: dict = None):
+        """Refresh the browser RWP token using the captured device header."""
+        if not device_id:
+            raise ValueError("device_id must come from browser session storage")
+        api = "/api/sns/web/v1/celestial/lt"
+        headers, cookies, _ = self._request_params(api, "", "GET")
+        # Chrome places this device header between x-xray-traceid and x-t;
+        # appending it would change the observable header order.
+        headers = _insert_header_after(
+            headers, "c_device_id", str(device_id), "x-xray-traceid"
+        )
+        target = self.base_url + api
+        response = self.http.get(
+            target, headers=headers, cookies=cookies,
+            proxies=self._proxies(proxies), timeout=REQUEST_TIMEOUT,
+        )
+        self._merge_response_cookies(response, target)
+        return response.json()
+
+    def get_user_board(self, user_id: str, *, num: int = 15, page: int = 1,
+                       proxies: dict = None):
+        """Fetch the user's public board list observed on the search page."""
+        api = splice_str("/api/sns/web/v1/board/user", {
+            "user_id": str(user_id), "num": num, "page": page,
+        })
+        headers, cookies, _ = self._request_params(api, "", "GET")
+        target = self.base_url + api
+        response = self.http.get(
+            target, headers=headers, cookies=cookies,
+            proxies=self._proxies(proxies), timeout=REQUEST_TIMEOUT,
+        )
+        self._merge_response_cookies(response, target)
+        return response.json()
+
+    def get_dqa_recommend(self, *, source: str = "diandian",
+                          proxies: dict = None):
+        """Fetch the discovery-question recommendations shown on Explore.
+
+        Chrome emits one required query member (``source``); keep it explicit
+        so callers cannot accidentally send a different or incomplete shape.
+        """
+        if source is None or source == "":
+            raise ValueError("source must match the captured browser query")
+        api = splice_str("/api/sns/web/v1/dqa/recommend/query",
+                         {"source": str(source)})
+        headers, cookies, _ = self._request_params(api, "", "GET",
+                                                   target_origin=self.so_base_url)
+        target = self.so_base_url + api
+        response = self.http.get(target, headers=headers, cookies=cookies,
+                                 proxies=self._proxies(proxies),
+                                 timeout=REQUEST_TIMEOUT)
+        self._merge_response_cookies(response, target)
+        return response.json()
+
+    def get_global_config(self, proxies: dict = None):
+        """Fetch the Explore global configuration route captured in Chrome."""
+        api = "/api/sns/web/global/config"
+        headers, cookies, _ = self._request_params(api, "", "GET")
+        target = self.base_url + api
+        response = self.http.get(target, headers=headers, cookies=cookies,
+                                 proxies=self._proxies(proxies),
+                                 timeout=REQUEST_TIMEOUT)
+        self._merge_response_cookies(response, target)
+        return response.json()
+
+    def get_worldcup_display_period(self, proxies: dict = None):
+        """Fetch the read-only World Cup display-period configuration."""
+        api = "/api/sns/web/worldcup/dots/display_period"
+        headers, cookies, _ = self._request_params(api, "", "GET")
+        target = self.base_url + api
+        response = self.http.get(target, headers=headers, cookies=cookies,
+                                 proxies=self._proxies(proxies),
+                                 timeout=REQUEST_TIMEOUT)
+        self._merge_response_cookies(response, target)
+        return response.json()
+
+    def get_worldcup_live_bar(self, proxies: dict = None):
+        """Fetch the read-only World Cup live-bar configuration."""
+        api = "/api/sns/web/worldcup/live_bar"
+        headers, cookies, _ = self._request_params(api, "", "GET")
+        target = self.base_url + api
+        response = self.http.get(target, headers=headers, cookies=cookies,
+                                 proxies=self._proxies(proxies),
+                                 timeout=REQUEST_TIMEOUT)
+        self._merge_response_cookies(response, target)
+        return response.json()
+
+    def sync_search_history(self, query: str, *, client_time: int = None,
+                            proxies: dict = None):
+        """Sync one search operation using the browser's exact body shape."""
+        timestamp = int(client_time if client_time is not None else time.time() * 1000)
+        api = "/api/sns/web/search/history/sync"
+        data = {
+            "client_time": timestamp,
+            "ops": [{"act": "search", "q": str(query), "ct": timestamp}],
+        }
+        headers, cookies, body = self._request_params(
+            api, data, "POST", target_origin=self.so_base_url
+        )
+        target = self.so_base_url + api
+        response = self.http.post(
+            target, headers=headers, data=body.encode("utf-8"), cookies=cookies,
+            proxies=self._proxies(proxies), timeout=REQUEST_TIMEOUT,
+        )
+        self._merge_response_cookies(response, target)
+        return response.json()
+
+    def sync_search_history_captured(
+        self,
+        *,
+        client_time: int,
+        ops,
+        proxies: dict = None,
+    ):
+        """Replay the complete search-history body captured from Chrome.
+
+        ``ops`` is kept as an explicit list because the browser sometimes
+        sends an empty list during bootstrap and uses a different operation
+        object after a user search.  No operation members are inferred here.
+        """
+        if not isinstance(ops, list):
+            raise ValueError('captured search-history ops must be a list')
+        data = {"client_time": int(client_time), "ops": ops}
+        api = "/api/sns/web/search/history/sync"
+        headers, cookies, body = self._request_params(
+            api, data, "POST", target_origin=self.so_base_url
+        )
+        target = self.so_base_url + api
+        response = self.http.post(
+            target, headers=headers, data=body.encode("utf-8"), cookies=cookies,
+            proxies=self._proxies(proxies), timeout=REQUEST_TIMEOUT,
+        )
+        self._merge_response_cookies(response, target)
+        return response.json()
+
+    def search_onebox(self, query: str, *, search_id: str = None,
+                      biz_type: str = "web_search_user", request_id: str = None,
+                      proxies: dict = None):
+        """Fetch search suggestions with the captured four-field JSON body."""
+        api = "/api/sns/web/v1/search/onebox"
+        data = {
+            "keyword": str(query),
+            "search_id": search_id or generate_search_id(),
+            "biz_type": str(biz_type),
+            "request_id": request_id or generate_search_request_id(),
+        }
+        headers, cookies, body = self._request_params(api, data, "POST")
+        target = self.base_url + api
+        response = self.http.post(
+            target, headers=headers, data=body.encode("utf-8"), cookies=cookies,
+            proxies=self._proxies(proxies), timeout=REQUEST_TIMEOUT,
+        )
+        self._merge_response_cookies(response, target)
+        return response.json()
+
+    def search_filter(self, keyword: str, search_id: str,
+                      proxies: dict = None):
+        """Fetch the filter groups for an existing browser search session."""
+        api = splice_str("/api/sns/web/v1/search/filter", {
+            "keyword": str(keyword), "search_id": str(search_id),
+        })
+        headers, cookies, _ = self._request_params(api, "", "GET")
+        target = self.base_url + api
+        response = self.http.get(
+            target, headers=headers, cookies=cookies,
+            proxies=self._proxies(proxies), timeout=REQUEST_TIMEOUT,
+        )
+        self._merge_response_cookies(response, target)
+        return response.json()
+
+    def _merge_response_cookies(self, response, source_url: str):
+        values = getattr(response, "cookies", None)
+        if values is not None and hasattr(values, "items"):
+            updates = dict(values.items())
+            if updates:
+                self.auth.update_cookies(updates, source_url=source_url)
 
     def search_note(self, query: str, page=1, sort_type_choice=0, note_type=0, note_time=0, note_range=0, pos_distance=0, geo="", search_id=None, proxies: dict = None):
         """
@@ -996,7 +1398,13 @@ class XHS_Apis():
         msg = '成功'
         video_addr = None
         try:
-            headers = build_pc_navigation_headers(get_common_headers())
+            # This is a non-login document request.  The current Chrome
+            # capture for webBuild 6.47.2 uses Chrome/152; keep the legacy
+            # 150 UA in get_common_headers() for the separate login cold
+            # chain, but align this public navigation call with the capture.
+            navigation_headers = get_common_headers()
+            navigation_headers['user-agent'] = PC_CURRENT_BROWSER_UA
+            headers = build_pc_navigation_headers(navigation_headers)
             url = f"https://www.xiaohongshu.com/explore/{note_id}"
             http = PcHttpClient()
             try:

@@ -50,7 +50,7 @@ function xsCommon(a1, xt, xs, dslPair, b1, options = {}) {
   if (!dslPair) throw new Error('xsCommon: dslPair 必传');
   const b1Value = String(b1);
   const config = typeof options === 'string' ? { webBuild: options } : options;
-  const webBuild = String(config.webBuild || '6.32.2');
+  const webBuild = String(config.webBuild || '6.47.2');
   // 2026-07-25 浏览器实证（zones/seccallback X-S-Common 解码）：
   // b1 未采集阶段浏览器发 x8: null（JSON null）且 x9 = gens9('null')，
   // 不是空字符串。服务端两种都容忍，字节级对齐以浏览器为准。
@@ -59,7 +59,7 @@ function xsCommon(a1, xt, xs, dslPair, b1, options = {}) {
     s0: 5,
     s1: '',
     x0: String(config.b1b1 || '1'),
-    x1: String(config.signVersion || '4.3.7'),
+    x1: String(config.signVersion || '4.4.3'),
     x2: String(config.platform || 'Windows'),
     x3: String(config.appId || 'xhs-pc-web'),
     x4: webBuild,
@@ -76,3 +76,4 @@ function xsCommon(a1, xt, xs, dslPair, b1, options = {}) {
 }
 
 module.exports = { xsCommon, gens9 };
+

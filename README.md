@@ -120,6 +120,8 @@
 | | 搜索笔记 & 搜索用户 | ✅ |
 | | 获取笔记评论 | ✅ |
 | | 获取未读消息 / 评论@提醒 / 点赞收藏 / 新增关注 | ✅ |
+| **直播 / 私信** | 直播间连接与事件监听（弹幕 / 点赞 / 进场 / 礼物等） | ✅ |
+| | 私信发送与接收（WebSocket + HTTP 兜底） | ✅ |
 | **创作者平台** | 二维码登录 / 手机验证码登录 | ✅ |
 | | 登录会话级自动重试（406 概率闸门） | ✅ |
 | | 上传图集作品 | ✅ |
@@ -248,19 +250,38 @@ auth = XHSPcAuth.from_qrcode_login()
 # 或复用已保存的登录 Cookie
 # auth = XHSPcAuth.from_cookie(cookies_str)
 
-api = XHS_Apis(auth).bootstrap()
+# 三种 Auth 工厂都会返回已 bootstrap 的 PC 登录态
+api = XHS_Apis(auth)
 success, message, data = api.get_unread_message()
 ```
 
-`XHSPcAuth` 的登录 Cookie 有三个来源：二维码登录、手机号登录、用户直接提供完整 Cookie。前两种会按 PC 页面顺序完成 `DS → 两段 scripting → login/activate → webprofile`：项目本地生成 `a1/webId/loadts/ets`、请求签名、`websectiga` 和约 11KB 的 `profileData`，匿名 `webprofile` 验收取得 `gid` 后才允许用户扫码或发送验证码，登录成功后用服务端正式 `web_session` 覆盖访客会话。整个过程不启动、不连接浏览器。第三种原样接收用户复制过来的完整 Cookie，不重造其登录态。
+如果同时需要 PC 内容/直播/私信和 Creator 发布，推荐使用统一入口，只扫码（或输
+入手机号）一次：
 
-Creator 端同样只允许通过三个工厂创建，业务 API 不再散传 Cookie、a1、b1 或 dsl：
+```python
+from apis.xhs_creator_apis import XHS_Creator_Apis
+from apis.xhs_live import XHSLiveAPI
+from xhs_utils.xhs_auth import XHSUnifiedAuth
+from apis.xhs_pc_apis import XHS_Apis
+
+auth = XHSUnifiedAuth.from_qrcode_login()
+try:
+    pc_api = XHS_Apis(auth.pc)
+    creator_api = XHS_Creator_Apis(auth.creator).bootstrap()
+    live_api = XHSLiveAPI(auth.pc)
+finally:
+    auth.close()
+```
+
+主站和 Creator 复用同一组服务端登录 Cookie，`auth.creator` 在第一次使用时才懒
+初始化；两边的 Storage、b1、MNS 和 X-s 按各自站点独立维护。仅单独使用 Creator
+时也可通过兼容工厂创建：
 
 ```python
 from apis.xhs_creator_apis import XHS_Creator_Apis
 from xhs_utils.xhs_creator import XHSCreatorAuth
 
-# 三选一：
+# 仅单独使用 Creator 时三选一（兼容入口）：
 creator_auth = XHSCreatorAuth.from_qrcode_login()
 # creator_auth = XHSCreatorAuth.from_phone_login()
 # creator_auth = XHSCreatorAuth.from_cookie(完整_creator_cookie)
@@ -269,31 +290,12 @@ creator_api = XHS_Creator_Apis(creator_auth).bootstrap()
 success, message, notes = creator_api.get_all_posted_notes()
 ```
 
-Creator 当前按浏览器 4.3.6 链路实现：`appId=ugc`、`webBuild=1.18.0`，启动阶段使用 `mns0201/nop`，安全状态就绪后切到 `mns0101/a1`。b1、MNS 装配、X-s、X-t、X-S-Common 和 profileData 均在本地计算；`mns0101` 尾部使用服务端 DS 程序导出的 `_dsf`，该程序在隔离的本地 Node VM 中执行。`_dsl`、DS/scripting code、登录 Cookie、gid 等仍按浏览器行为从服务端取得，用户无需填写。二维码和手机号登录都不启动或连接浏览器。
+几点说明：
 
-关于登录与发布的可靠性（26/07/25 补充）：Creator customer 域登录动作存在按设备会话标记的概率性 HTTP 406（与字段和签名无关），登录流程已内置会话级自动重试（整包重建匿名设备，上限 16 次）。b1 增加每会话抖动（x36/x37/x39/x84），避免静态指纹跨设备聚类。发布链路已按浏览器实抓对齐：permit 与 query_transcode 使用 `mns0101/nop` 冷档签名（视频转码轮询依赖 PC 侧 `web_session`，可通过 PC 扫码登录取得）、未选地点时省略 `post_loc` 键、发布请求携带 Creator 436B 指纹模板的 `x-rap-param`（浏览器信封 AES 解密还原，Uuid 每次随机）、code=-1 概率拒绝自动重发。全部 XHR 请求不再携带 `sec-ch-ua*` 客户端提示头（与浏览器行为一致，仅导航请求保留）。
-
-`profileData` 已提纯为显式字段纯算：按固定顺序序列化 `x1..x84`，再执行 UTF-8/Base64、DES-ECB 零填充和 hex 编码。项目不会构造浏览器对象，也不会加载或执行原始指纹 SDK。正常用户无需填写这些字段；需要复现特定设备时，可通过三个工厂方法的 `web_profile_fields={...}` 参数覆盖字段，或用 `web_profile_i12_seed`、`web_profile_fi` 对齐两个小型动态段。
-
-正常运行不需要传 b1、DSL 或浏览器 Storage。只有逆向调试、版本升级对齐时，才使用 `b1_state`、Storage 快照、`web_build` 或 `mns_env` 覆盖。
-
-b1 默认不是从浏览器读取，而是“仓库内置的本地设备/页面指纹模板 + 当前时间与会话动态计数”，交给本地 JS 算法纯算生成。这里的“内置”指项目固化的逆向模板，不是内置或托管了一个浏览器。
-
-PC 参数来源是明确分层的：
-
-| 来源 | 参数 |
-|------|------|
-| 用户选择 | `cookie`、`qrcode` 或 `phone` 登录模式 |
-| 仅逆向对齐可选 | 预计算 `b1`、`dsl`、`user_id`、保存的运行时状态、`b1_state`、`web_build`、`mns_env`、RAP 指纹、webprofile 字段/动态段覆盖 |
-| JS 算法生成 | b1、MNS0101/0201/0301、X-s、X-t、X-S-Common、x-rap-param、websectiga、profileData |
-| Python 状态与请求组装 | loadts、ets、seq、traceid、xy-direction、search_id、request_id |
-| 自动维护的生命周期 | dsllt、last_tiga_update_time、p1、sc、tab device ID、RWP fingerprint、unread |
-| 远程程序或锚点 | `_dsl`、websectiga scripting code |
-| 服务端签发 | `web_session`、`id_token`、`gid`、`sec_poison_id`、验证码挑战、登录 token、RWP login token |
-
-签名加密没有 JS/Python 两套实现：PC 与 Creator 共用算法唯一来源 `xhs_utils/xhs_core/js/`，平台目录只保留各自状态、参数装配和兼容入口；Python 的 `runtime.py` 只负责调用 Node 和校验结果。
-
-> `web_session` 是服务端登录凭证，不能通过算法伪造；二维码和手机号模式会通过服务端登录流程取得，但全程不需要浏览器。
+- 签名与指纹（b1、MNS、X-s、X-S-Common、x-rap-param、profileData 等）全部本地纯算，算法唯一实现在 `xhs_utils/xhs_core/js/`；全程不启动、不连接浏览器。
+- 二维码/手机号登录会自动完成设备初始化和 Storage 维护（webSsk 协商、直播/私信所需的 RWP token 等）；登录与发布中的概率性 406 / `code=-1` 拒绝已内置自动重试。
+- `web_session` 是服务端签发的登录凭证，无法通过算法伪造；cookie 模式原样复用用户提供的完整 Cookie。
+- 正常使用无需传 b1、DSL 或浏览器 Storage；这些覆盖参数仅供逆向调试和版本对齐，且只能通过 `from_cookie()` 传入。
 
 ### 🚀 运行项目
 
@@ -302,6 +304,8 @@ PC 参数来源是明确分层的：
 ```bash
 python -m spider.spider
 ```
+
+发布 / 直播监听 / 私信示例见根目录 `demo.py`，修改顶部参数后运行 `python demo.py`。
 
 ### 🐳 Docker 部署（可选）
 
@@ -319,10 +323,12 @@ Spider_XHS/
 ├── spider/
 │   ├── __init__.py
 │   └── spider.py                    # 主入口：爬虫调用示例
+├── demo.py                          # 扫码登录后的发布/直播/私信最小示例
 ├── apis/
 │   ├── xhs_pc_apis.py               # 小红书PC端完整API（采集）
 │   ├── xhs_creator_apis.py          # 创作者平台API（上传发布）
 │   ├── xhs_pc_login_apis.py         # PC端登录（二维码/手机验证码）
+│   ├── xhs_live.py                   # 直播间 HTTP/RWP/IM（抓包对齐）
 │   ├── xhs_creator_login_apis.py    # 创作者平台登录
 │   ├── xhs_pugongying_apis.py       # 蒲公英平台API（KOL数据）
 │   └── xhs_qianfan_apis.py          # 千帆平台API（分销商数据）
@@ -330,22 +336,10 @@ Spider_XHS/
 │   ├── common_util.py               # 初始化工具（读取.env配置）
 │   ├── cookie_util.py               # Cookie解析
 │   ├── data_util.py                 # 数据处理（Excel保存、媒体下载）
-│   ├── xhs_pc/                      # PC鉴权与签名完整模块
-│   │   ├── auth.py                  # 用户输入与参数归属
-│   │   ├── state.py                 # 设备、页面与会话状态
-│   │   ├── params.py                # 请求参数和请求头组装
-│   │   ├── runtime.py               # Node调用与输出校验，不重复算法
-│   │   ├── dsl.py                   # DS远程锚点获取
-│   │   └── js/                      # 仅 PC 特有模板（profile/rap/deflate/aes）
-│   ├── xhs_creator/                 # Creator鉴权、4.3.6状态与请求装配
-│   │   ├── auth.py                  # 三种登录来源和参数归属
-│   │   ├── state.py                 # b1/MNS/profileData生命周期
-│   │   ├── params.py                # X-s/X-S-Common与浏览器请求头
-│   │   ├── runtime.py               # 共用算法的Node调用与门禁
-│   │   └── js/                      # Creator 特有模板与上传签名（profile/reference/rap指纹/sign/signature）
-│   ├── xhs_core/                    # PC/Creator共用纯算和DS/websectiga核心
-│   │   └── js/                      # b1/MNS/X-s/X-S-Common算法唯一实现
-│   ├── xhs_auth.py                  # PC/Creator统一兼容导入层
+│   ├── xhs_pc/                      # PC 鉴权、状态与请求装配（js/ 为 PC 特有模板）
+│   ├── xhs_creator/                 # Creator 鉴权、状态与请求装配（js/ 为 Creator 特有模板）
+│   ├── xhs_core/                    # PC/Creator 共用签名算法唯一实现（js/）
+│   ├── xhs_auth.py                  # PC/Creator 统一登录入口
 │   ├── xhs_util.py                  # 旧导入路径兼容层
 │   ├── xhs_creator_util.py          # Creator上传/发布业务数据辅助
 │   ├── xhs_pugongying_util.py       # 蒲公英平台工具
@@ -362,6 +356,7 @@ Spider_XHS/
 
 - `spider/spider.py` 是爬虫入口，可根据需求修改调用逻辑
 - `apis/xhs_pc_apis.py` 包含所有 PC 端数据接口
+- `apis/xhs_live.py` 提供直播间事件接收、弹幕发送与私信收发；发送端仅支持文本消息，不会发送礼物
 - `apis/xhs_creator_apis.py` 包含创作者平台发布接口
 - `xhs_utils/xhs_pc/` 是 PC 端鉴权、参数状态和签名算法的统一入口
 - `xhs_utils/xhs_creator/` 是 Creator 端鉴权、参数状态和签名装配的统一入口
@@ -389,7 +384,8 @@ Spider_XHS/
 | 25/07/15 | 更新 xs version56 & 小红书创作者接口 |
 | 26/04/11 | 重构创作者平台 API（图集 / 视频上传），新增蒲公英 KOL 数据 API，新增千帆分销商 API，签名算法升级至最新版 |
 | 26/04/28 | 更新 PC 端搜索与笔记详情风控参数，新增 `search_id` 当前算法与 `x-rap-param` 本地 JSVMP 生成，补充 `a1`、`web_id`、`websectiga` 等签名参数说明 |
-| 26/07/25 | 更新全部算法：登录内置按设备会话的 406 概率闸门自动重试；b1 会话级抖动防指纹聚类；发布链路对齐浏览器（permit/query_transcode 冷档签名、省略空 post_loc、上传 header 对齐、发布携带 Creator 436B 指纹 x-rap-param、code=-1 自动重发）；X-S-Common 空 b1 阶段对齐浏览器（x8:null）；全部 XHR 去除 sec-ch-ua* 客户端提示头 |
+| 26/07/25 | 更新全部算法：登录 406 自动重试、b1 会话级抖动、发布链路对齐浏览器实抓、XHR 去除 sec-ch-ua* |
+| 26/09/07 | Chrome 152 复核：PC 升级 X-s 4.4.3 并加入 webSsk 协商；Creator 升级 webBuild=1.26.0；新增直播/私信接口与根目录 `demo.py` |
 
 ---
 

@@ -28,16 +28,57 @@ function b64XS(e) {
   else if (c === 2) { const t = (e[a - 2] << 8) + e[a - 1]; d.push(ALPHABET_XS[t >> 10] + ALPHABET_XS[(t >> 4) & 63] + ALPHABET_XS[(t << 2) & 63] + '='); }
   return d.join('');
 }
+
+function parseWebSsk(value, appId) {
+  let storage = value;
+  if (typeof storage === 'string') {
+    if (!storage) return null;
+    try { storage = JSON.parse(storage); } catch (_) { return null; }
+  }
+  if (!storage || typeof storage !== 'object') return null;
+  const encoded = storage[appId];
+  if (typeof encoded !== 'string' || !encoded) return null;
+  const raw = Buffer.from(encoded, 'base64');
+  return raw.length >= 32 ? raw : null;
+}
+
+function buildEncSskSign(md5FullBytes, webSsk, appId, options = {}) {
+  const secret = parseWebSsk(webSsk, appId);
+  if (!secret) return null;
+  const nonce = Buffer.allocUnsafe(4);
+  const randomValue = options.sskRandom != null
+    ? (Number(options.sskRandom) >>> 0)
+    : crypto.randomBytes(4).readUInt32LE(0);
+  const timestamp = options.sskTimestamp != null
+    ? (Number(options.sskTimestamp) >>> 0)
+    : (Date.now() >>> 0);
+  nonce.writeUInt32LE((timestamp + randomValue) >>> 0, 0);
+  const digest = crypto.createHash('sha1').update(Buffer.concat([secret, nonce])).digest();
+  const encSsk = Buffer.concat([nonce, digest, secret.subarray(32)]);
+  const encSskSign = crypto.createHash('sha1')
+    .update(Buffer.concat([Buffer.from(md5FullBytes), encSsk]))
+    .digest('base64');
+  return {
+    encSskSign: { [appId]: encSskSign },
+    encSsk: { [appId]: encSsk.toString('base64') },
+  };
+}
+
 function encodeXs(x3, x4Value, options = {}) {
   // Browser's seccore_signv2 always sets x4 = (data ? typeof data : '')
   // For empty data (GET), x4 = ''; for object data, x4 = 'object'; for string data, x4 = 'string'
   const signObj = {
-    x0: String(options.signVersion || '4.3.7'),
+    x0: String(options.signVersion || '4.4.3'),
     x1: String(options.appId || 'xhs-pc-web'),
     x2: String(options.platform || 'Windows'),
     x3,
     x4: x4Value,
   };
+  // Current PC envelopes append x5 and, after webSsk activation, x6/x7.
+  // Creator 4.3.6 envelopes stop at x4.
+  if (options.x5 != null) signObj.x5 = String(options.x5);
+  if (options.x6 != null) signObj.x6 = options.x6;
+  if (options.x7 != null) signObj.x7 = options.x7;
   return 'XYS_' + b64XS(encodeUtf8(JSON.stringify(signObj)));
 }
 
@@ -95,7 +136,13 @@ function signFull(input) {
   const tier = input.tier || '0301';
   const deviceTag = String(input.deviceTag || input.dsn || 'a3');
   let dsSigBytes = input.dsSigBytes;
-  if (deviceTag !== 'nop' && !dsSigBytes && input.dsfProgram) {
+  // Creator's Python adapter historically called this context field
+  // ``dsProgram`` while the standalone signer used ``dsfProgram``.  Accept
+  // both spellings so the server-issued _dsf program is actually executed
+  // for mns0101/a1 requests instead of silently falling back to the static
+  // placeholder hash.
+  const dsfProgram = input.dsfProgram || input.dsProgram;
+  if (deviceTag !== 'nop' && !dsSigBytes && dsfProgram) {
     const dsfInput = [];
     let timestamp = BigInt(now);
     for (let index = 0; index < 8; index++) {
@@ -103,7 +150,7 @@ function signFull(input) {
       timestamp >>= 8n;
     }
     dsfInput.push(...md5Url);
-    dsSigBytes = runDsfProgram(input.dsfProgram, dsfInput, input.dsfTimeoutMs);
+    dsSigBytes = runDsfProgram(dsfProgram, dsfInput, input.dsfTimeoutMs);
   }
   const x3 = signTier({
     api: input.api,
@@ -122,7 +169,24 @@ function signFull(input) {
     md5UrlBytes: md5Url,
     fullLen,
   }, tier);
-  const xs = encodeXs(x3, x4Label, input);
+  const xsOptions = { ...input };
+  const appId = String(input.appId || 'xhs-pc-web');
+  if (appId === 'xhs-pc-web') {
+    xsOptions.x5 = Buffer.from(md5Full).toString('hex');
+    const ssk = buildEncSskSign(md5Full, input.webSsk, appId, input);
+    if (ssk) {
+      xsOptions.x6 = ssk.encSskSign;
+      xsOptions.x7 = ssk.encSsk;
+    } else {
+      delete xsOptions.x6;
+      delete xsOptions.x7;
+    }
+  } else {
+    delete xsOptions.x5;
+    delete xsOptions.x6;
+    delete xsOptions.x7;
+  }
+  const xs = encodeXs(x3, x4Label, xsOptions);
   // Browser builds MNS first, then samples Date.now() again for X-t.
   const xt = input.xt != null ? String(input.xt) : String(Date.now());
   const out = { x3, xs, xt, len: x3.length, prefix: x3.slice(0, 12), tier, pure: true };
@@ -154,4 +218,8 @@ function main() {
 
 if (require.main === module) main();
 
-module.exports = { signFull, encodeXs, encodeUtf8, b64XS, runDsfProgram, main };
+module.exports = {
+  signFull, encodeXs, encodeUtf8, b64XS, runDsfProgram,
+  parseWebSsk, buildEncSskSign, main,
+};
+

@@ -42,6 +42,28 @@ function buildProfileFields(options = {}) {
     }
 
     const fields = clone(profileReference.fields);
+    // A complete DevTools capture can be replayed byte-for-byte.  In this
+    // mode every field is required and preserved; no local timestamp, cookie,
+    // telemetry, or i12 value is substituted.
+    if (options.exactFields === true) {
+        const captured = options.fields;
+        if (!captured || typeof captured !== 'object' || Array.isArray(captured)) {
+            throw new TypeError('exactFields requires captured fields');
+        }
+        const expected = Object.keys(fields);
+        const missing = expected.filter((key) => !Object.prototype.hasOwnProperty.call(captured, key));
+        const extra = Object.keys(captured).filter((key) => !Object.prototype.hasOwnProperty.call(fields, key));
+        if (missing.length || extra.length) {
+            throw new TypeError(`exactFields schema mismatch; missing=${missing.join(',')}; extra=${extra.join(',')}`);
+        }
+        return clone(captured);
+    }
+    // Keep historical 6.32.2 fixtures reproducible while using the current
+    // 6.47.2 browser profile by default. Cookie input selects old fixtures.
+    const cookie = String(options.documentCookie || '');
+    if (/webBuild=6\.32\.2(?:;|$)/.test(cookie)) {
+        fields.x1 = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36';
+    }
     const timestampMs = integerOption(options.timestampMs, Date.now(), 1, Number.MAX_SAFE_INTEGER);
     const ets = integerOption(options.ets, timestampMs, 1, Number.MAX_SAFE_INTEGER);
     const i12Seed = integerOption(
